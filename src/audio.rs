@@ -82,6 +82,9 @@ pub struct AudioPlayback {
     multiplier: Arc<AtomicF32>,
     low_latency: bool,
     channels: usize,
+    /// Tope de la cola en SAMPLES (fix 29/10: con bloques Default de
+    /// ~4096 frames, el tope "30 bloques" permitía ~2.5s de latencia).
+    cap_samples: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AudioPlayback {
@@ -91,10 +94,17 @@ impl AudioPlayback {
             multiplier: Arc::new(AtomicF32::new(0.2)),
             low_latency,
             channels,
+            cap_samples: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     pub fn start(&self, sample_rate: u32, block_size: u32) -> Result<Stream> {
+        // tope por tiempo: ~0.75s de audio buffered, sea cual sea el
+        // tamaño de bloque de entrada
+        self.cap_samples.store(
+            (0.75 * sample_rate as f32) as usize * self.channels,
+            Ordering::Relaxed,
+        );
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -109,16 +119,32 @@ impl AudioPlayback {
             .build_output_stream(
                 &config,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    // Fix 29/10: consumir FRAME-EXACTO acumulando entre
+                    // bloques de entrada (la entrada corre con
+                    // BufferSize::Default ~4096 frames y el match
+                    // bloque-a-bloque descartaba 3/4 de cada bloque =
+                    // distorsion total). Patron del router virtual del
+                    // passthrough: pop, copiar lo que entra, DEVOLVER el
+                    // resto a la cabeza de la cola.
                     let mut buf = buffer.lock().unwrap();
-                    match buf.pop_front() {
-                        Some(data) => {
-                            let n = data.len().min(out.len());
-                            out[..n].copy_from_slice(&data[..n]);
-                            for s in &mut out[n..] {
-                                *s = 0.0;
+                    let mut pos = 0;
+                    while pos < out.len() {
+                        match buf.pop_front() {
+                            Some(data) => {
+                                let n = data.len().min(out.len() - pos);
+                                out[pos..pos + n].copy_from_slice(&data[..n]);
+                                if n < data.len() {
+                                    buf.push_front(data[n..].to_vec());
+                                }
+                                pos += n;
+                            }
+                            None => {
+                                for s in &mut out[pos..] {
+                                    *s = 0.0;
+                                }
+                                pos = out.len();
                             }
                         }
-                        None => out.fill(0.0),
                     }
                 },
                 |err| eprintln!("Audio output status: {err}"),
@@ -149,17 +175,25 @@ impl AudioPlayback {
         // Nuevo: sin tope agresivo; catch-up solo si se acumula GROSERA
         // cantidad (>30 bloques, un callback dormido >~170ms) para no
         // acumular latencia infinita.
-        let mut buf = self.buffer.lock().unwrap();
-        while buf.len() > 30 {
-            buf.pop_front();
-        }
+        // Fix 29/10: tope por SAMPLES (~0.75s) — el tope de bloques
+        // dependía del tamaño de bloque de entrada (Default ~4096 frames)
         let m = self.multiplier.get();
         if m != 1.0 {
             for s in &mut data {
                 *s *= m;
             }
         }
+        let mut buf = self.buffer.lock().unwrap();
         buf.push_back(data);
+        let cap = self.cap_samples.load(Ordering::Relaxed);
+        if cap > 0 {
+            let mut total: usize = buf.iter().map(|b| b.len()).sum();
+            while total > cap && buf.len() > 1 {
+                if let Some(d) = buf.pop_front() {
+                    total -= d.len();
+                }
+            }
+        }
     }
 }
 
