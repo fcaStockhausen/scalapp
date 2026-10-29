@@ -12,6 +12,7 @@ use std::io::BufRead;
 use std::sync::Arc;
 
 use audio::AudioCapture;
+use nokhwa::utils::CameraIndex;
 use passthrough::PassthroughWithVolume;
 use sync::{AVMonitor, SyncController};
 use video::VideoCapture;
@@ -297,8 +298,11 @@ fn run(args: Args) -> Result<()> {
     );
 
     let video_capture = if !audio_only {
-        let video_device = match args.video_device {
-            Some(id) => Some(id as u32),
+        // Identidad del dispositivo: uniqueID del autodetect (determinista;
+        // el orden de índices de AVFoundation baila entre sesiones) o el
+        // índice explícito del usuario.
+        let device = match args.video_device {
+            Some(id) => CameraIndex::Index(id as u32),
             None => {
                 let candidates = devices::auto_detect_video();
                 match candidates.first() {
@@ -307,21 +311,24 @@ fn run(args: Args) -> Result<()> {
                             "Auto-detected HDMI video device: {} (ID: {})",
                             c.name, c.id
                         );
-                        Some(c.id)
+                        CameraIndex::String(c.unique_id.clone())
                     }
                     None => {
-                        println!("Using fallback video device: 1");
-                        Some(1)
+                        println!("Using fallback video device index: 1");
+                        CameraIndex::Index(1)
                     }
                 }
             }
         };
-        let capture = Arc::new(VideoCapture::new(
-            video_device.unwrap_or(0),
+        let mut capture = VideoCapture::new(
+            device,
             args.video_width,
             args.video_height,
             args.video_fps,
-        ));
+        );
+        // si el usuario fijó --video-device N, respetarlo (sin escaneo)
+        capture.set_allow_index_scan(args.video_device.is_none());
+        let capture = Arc::new(capture);
         println!(
             "✓ Video capture initialized: {}x{} @ {}fps",
             args.video_width, args.video_height, args.video_fps
@@ -427,12 +434,15 @@ fn run(args: Args) -> Result<()> {
         volume_console_loop(&mut target, None);
         Ok::<(), anyhow::Error>(())
     } else {
-        let target_fps = video_capture
+        let video = video_capture
             .as_ref()
-            .map(|v| v.fps as f32)
-            .unwrap_or(60.0);
-        renderer::run(sync_controller.clone(), target_fps, Some(audio_streams.clone()))
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .expect("A/V mode always builds a video capture");
+        renderer::run(
+            sync_controller.clone(),
+            Arc::clone(video),
+            Some(audio_streams.clone()),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))
     };
 
     println!("\nStopping AV Monitor...");

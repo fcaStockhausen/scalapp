@@ -12,10 +12,16 @@ Monitor A/V en **Rust** para **visualizar una capturadora HDMI USB** con **audio
 
 ```
 UVC Video Capture ─┐
-                    ├─► Timestamped Queues ─► Sync Controller ─► Renderer (egui)
-UAC Audio Capture ─┘                     ↑
-                                   Audio Clock
+                    ├─► Latest-wins slot ─► Renderer (egui)   SyncController = monitor de drift
+UAC Audio Capture ─┘      (single)              ↑                  (reloj de audio vs video)
+                                              Audio Clock
 ```
+
+El video corre con semántica **latest-wins** (Fase 1 del ROADMAP):
+single-slot, el renderer pinta siempre el último frame disponible
+(latencia de cola = 0), la captura pide el formato exacto
+1920x1080@60 al dispositivo y el overlay mide por separado fps de
+captura, fps pintados, frames skipped y edad del frame.
 
 | Python | Rust | Crate |
 |---|---|---|
@@ -71,10 +77,10 @@ src/
 ├── main.rs          CLI, orquestación (equivale a main.py)
 ├── audio.rs         AudioCapture + AudioPlayback (audio_capture.py)
 ├── passthrough.rs   Passthrough V4 con volumen (ultra_low_latency_passthrough.py)
-├── video.rs         VideoCapture con buffer timestamped (video_capture.py)
-├── sync.rs          SyncController + AVMonitor (sync_controller.py)
-├── renderer.rs      Ventana egui con overlays (video_renderer.py)
-├── devices.rs       Auto-detección HDMI + test-audio + list-devices
+├── video.rs         VideoCapture con slot latest-wins + formato exacto (video_capture.py)
+├── sync.rs          SyncController (monitor de drift A/V) + AVMonitor
+├── renderer.rs      Ventana egui con overlays y medidores de fps
+├── devices.rs       Auto-detección HDMI (por uniqueID) + test-audio + list-devices
 └── atomicf32.rs     Helper para volumen lock-free entre callbacks
 ```
 
@@ -82,14 +88,14 @@ src/
 
 1. **Fix**: `V` (subir volumen) no funcionaba en Python porque el input se pasaba a minúsculas antes de comparar. Aquí `V` sube volumen.
 2. **IDs de dispositivos**: Python usa los índices intercalados de PortAudio (input+output juntos); Rust numera inputs y outputs por separado (los IDs mostrados por `--list-devices` son consistentes entre sí).
-3. **Captura de video**: nokhwa negocia la resolución más alta disponible (las capturadoras HDMI entregan 1080p/60 MJPG); Python forzaba FOURCC MJPG, que el backend AVFoundation de OpenCV ignoraba en la práctica.
+3. **Captura de video**: se pide el formato exacto 1920x1080@60 (YUYV — macOS no expone los modos MJPEG de la MS2131) y se abre por uniqueID de AVFoundation porque el orden de índices cambia entre sesiones. Python forzaba FOURCC MJPG, que el backend AVFoundation de OpenCV ignoraba en la práctica.
 4. El panel flotante con hover del renderer PyQt se reemplaza por la barra de controles + teclas; en modo borderless los controles se ocultan igual.
 
 ## Tests
 
 ```bash
-cargo test    # escala de volumen, ring buffer, frame-hold, drift stats, parser de comandos
-cargo clippy  # sin warnings
+cargo test    # escala de volumen, ring buffer, latest-wins slot, drift stats, parser de comandos
+cargo clippy  # sin warnings nuevos (quedan 6 de clippy 1.98 sobre código previo: passthrough.rs/main.rs)
 ```
 
 Nota: `cargo build` puede avisar sobre `block v0.1.6` (dependencia transitiva de nokhwa); es upstream y no afecta.

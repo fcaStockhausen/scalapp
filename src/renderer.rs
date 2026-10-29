@@ -1,32 +1,66 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, FontId, pos2, vec2, Rect};
 
 use crate::audio::AudioStreams;
 use crate::sync::SyncController;
+use crate::video::VideoCapture;
+
+/// Contador de fps genérico (Fase 1: medir lo que llega a pantalla).
+struct FpsMeter {
+    count: u64,
+    fps: f32,
+    last: Instant,
+}
+
+impl FpsMeter {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            fps: 0.0,
+            last: Instant::now(),
+        }
+    }
+
+    fn tick(&mut self) {
+        self.count += 1;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f32();
+        if elapsed >= 1.0 {
+            self.fps = self.count as f32 / elapsed;
+            self.count = 0;
+            self.last = now;
+        }
+    }
+}
 
 pub struct RendererApp {
     sync: Arc<SyncController>,
+    video: Arc<VideoCapture>,
     texture: egui::TextureHandle,
     last_frame_number: u64,
+    /// Buffer RGBA reutilizado frame a frame (sin realloc por frame).
     rgba: Vec<u8>,
     texture_size: [usize; 2],
     show_overlay: bool,
     show_stats: bool,
     volume_pct: f32,
     borderless: bool,
-    target_fps: f32,
     status_text: String,
     audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
+    /// Frames NUEVOS pintados por segundo (lo que realmente llega a pantalla).
+    painted_fps: FpsMeter,
+    /// Repaints por segundo del loop de egui.
+    loop_fps: FpsMeter,
 }
 
 impl RendererApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         sync: Arc<SyncController>,
-        target_fps: f32,
+        video: Arc<VideoCapture>,
         audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
     ) -> Self {
         let texture = cc.egui_ctx.load_texture(
@@ -36,6 +70,7 @@ impl RendererApp {
         );
         Self {
             sync,
+            video,
             texture,
             last_frame_number: u64::MAX,
             rgba: Vec::new(),
@@ -44,43 +79,49 @@ impl RendererApp {
             show_stats: false,
             volume_pct: 50.0,
             borderless: false,
-            target_fps,
             status_text: "Initializing...".into(),
             audio_streams,
+            painted_fps: FpsMeter::new(),
+            loop_fps: FpsMeter::new(),
         }
     }
 
+    /// Latest-wins: toma SIEMPRE el último frame del slot de captura.
     fn pull_frame(&mut self) {
-        if let Some((frame_number, _, width, height)) = self.sync.current_frame_meta() {
-            if frame_number != self.last_frame_number {
-                if let Some((w, h)) = self.sync.copy_current_frame_into(&mut self.rgba) {
-                    let expected = (w as usize) * (h as usize) * 3;
-                    if self.rgba.len() == expected {
-                        self.rgba.reserve(expected + expected / 3);
-                        let rgba: Vec<u8> = self
-                            .rgba
-                            .as_chunks::<3>()
-                            .0
-                            .iter()
-                            .flat_map(|px| [px[0], px[1], px[2], 255])
-                            .collect();
-                        let image =
-                            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-                        self.texture.set(image, egui::TextureOptions::LINEAR);
-                        self.texture_size = [w as usize, h as usize];
-                        self.last_frame_number = frame_number;
-                    }
-                }
-                let _ = (width, height);
-            }
+        let frame = match self.video.get_latest_frame() {
+            Some(f) => f,
+            None => return,
+        };
+        if frame.frame_number == self.last_frame_number {
+            return;
         }
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let expected_src = w * h * 3;
+        if frame.data.len() < expected_src {
+            return;
+        }
+        // RGB → RGBA en buffer reutilizado (el alpha queda fijado en 255)
+        self.rgba.resize(w * h * 4, 255);
+        let src_pixels = frame.data.as_chunks::<3>().0;
+        for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.rgba);
+        self.texture.set(image, egui::TextureOptions::LINEAR);
+        self.texture_size = [w, h];
+        self.last_frame_number = frame.frame_number;
+        self.video.mark_displayed(frame.frame_number);
+        self.painted_fps.tick();
     }
 
     fn update_status(&mut self) {
         let status = self.sync.get_sync_status();
         let perf = self.sync.get_performance_stats();
         self.status_text = format!(
-            "Audio: {:.2}s | Video: {:.2}s | A/V Diff: {:+.1}ms | Sync: {} | Dropped: {} | Avg Drift: {:.1}ms",
+            "Audio: {:.2}s | Video: {:.2}s | A/V Diff: {:+.1}ms | Sync: {} | Skipped: {} | Avg Drift: {:.1}ms",
             status.audio_time,
             status.video_time,
             status.audio_video_diff * 1000.0,
@@ -117,25 +158,39 @@ impl RendererApp {
     fn draw_overlay(&self, painter: &egui::Painter) {
         let mut lines: Vec<String> = Vec::new();
         if self.show_overlay {
-            if let Some((frame_number, timestamp, _, _)) = self.sync.current_frame_meta() {
-                lines.push(format!("Frame: {frame_number}"));
-                lines.push(format!("Time: {timestamp:.3}s"));
-                lines.push(format!("FPS: {:.1}", self.target_fps));
+            if let Some(frame) = self.video.get_latest_frame() {
+                lines.push(format!("Frame: {}", frame.frame_number));
+                lines.push(format!("Time: {:.3}s", frame.timestamp));
+                let cap_stats = self.video.get_capture_stats();
+                lines.push(format!(
+                    "FPS: out {:.1} / cap {:.1} / target {}",
+                    self.painted_fps.fps, cap_stats.fps_actual, self.video.fps
+                ));
             }
         }
         if self.show_stats {
             let status = self.sync.get_sync_status();
             let perf = self.sync.get_performance_stats();
+            let cap_stats = self.video.get_capture_stats();
             lines.push(format!(
                 "Resolution: {}x{}",
                 self.texture_size[0], self.texture_size[1]
             ));
             lines.push(format!(
-                "A/V Diff: {:+.1}ms ({})",
+                "FPS: cap {:.1} | out {:.1} | loop {:.1}",
+                cap_stats.fps_actual, self.painted_fps.fps, self.loop_fps.fps
+            ));
+            if let Some(frame) = self.video.get_latest_frame() {
+                if let Some(age) = self.video.frame_age_secs(&frame) {
+                    lines.push(format!("Frame age: {:.1}ms", age * 1000.0));
+                }
+            }
+            lines.push(format!("Skipped: {}", cap_stats.skipped_frames));
+            lines.push(format!(
+                "A/V Drift: {:+.1}ms ({})",
                 status.audio_video_diff * 1000.0,
                 if status.is_synced { "synced" } else { "drift" }
             ));
-            lines.push(format!("Dropped: {}", status.video_frames_dropped));
             lines.push(format!("Avg Drift: {:.1}ms", perf.avg_drift_ms));
         }
 
@@ -157,6 +212,7 @@ impl eframe::App for RendererApp {
         if let Some(streams) = &self.audio_streams {
             streams.lock().unwrap().poll_rebuild();
         }
+        self.loop_fps.tick();
         let toggle_f = ctx.input(|i| i.key_pressed(egui::Key::F));
         let toggle_o = ctx.input(|i| i.key_pressed(egui::Key::O));
         let toggle_s = ctx.input(|i| i.key_pressed(egui::Key::S));
@@ -234,24 +290,32 @@ impl eframe::App for RendererApp {
 
         self.pull_frame();
         self.update_status();
-        ctx.request_repaint_after(Duration::from_millis(15));
+        // Fase 1: 8ms mientras llega el repaint dirigido por frames (Fase 2)
+        ctx.request_repaint_after(Duration::from_millis(8));
     }
 }
 
 pub fn run(
     sync: Arc<SyncController>,
-    target_fps: f32,
+    video: Arc<VideoCapture>,
     audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
 ) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
-            .with_title("ScalApp AV Monitor - Latency Tolerant"),
+            .with_title("ScalApp AV Monitor - Direct Output"),
         ..Default::default()
     };
     eframe::run_native(
         "scalapp-av-monitor",
         options,
-        Box::new(move |cc| Ok(Box::new(RendererApp::new(cc, sync, target_fps, audio_streams)))),
+        Box::new(move |cc| {
+            Ok(Box::new(RendererApp::new(
+                cc,
+                sync,
+                video,
+                audio_streams,
+            )))
+        }),
     )
 }

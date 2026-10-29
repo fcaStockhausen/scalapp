@@ -4,16 +4,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioCapture;
-use crate::video::{TimestampedFrame, VideoCapture};
+use crate::video::VideoCapture;
 
 #[derive(Clone)]
 pub struct SyncStatus {
     pub audio_time: f64,
     pub video_time: f64,
+    /// Drift A/V relativo al baseline capturado al arrancar (el offset
+    /// constante entre relojes de audio y video no es desincronización).
     pub audio_video_diff: f64,
+    /// Frames sobrescritos en el slot latest-wins sin mostrarse.
     pub video_frames_dropped: u64,
     pub audio_buffer_samples: usize,
-    pub video_buffer_frames: usize,
+    pub video_capture_fps: f32,
     pub is_synced: bool,
 }
 
@@ -32,7 +35,9 @@ struct StatsInner {
     total_sync_checks: u64,
     drift_samples: VecDeque<f64>,
     max_drift_seen: f64,
-    frame_update_time: f64,
+    /// Offset A/V observado al terminar el warmup; el drift reportado es
+    /// la diferencia respecto de este baseline.
+    baseline_diff: Option<f64>,
 }
 
 impl StatsInner {
@@ -47,12 +52,14 @@ impl StatsInner {
     }
 }
 
+/// El SyncController ya no es dueño del frame visible: con latest-wins el
+/// renderer lee el slot de VideoCapture directamente. Este controlador
+/// queda como monitor de drift A/V (reloj de audio vs timestamps de video).
 pub struct SyncController {
     audio: Arc<AudioCapture>,
     video: Option<Arc<VideoCapture>>,
     max_video_drift: f64,
     sync_check_interval: f64,
-    current_frame: Arc<Mutex<Option<TimestampedFrame>>>,
     stats: Mutex<StatsInner>,
     running: Arc<AtomicBool>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -65,13 +72,12 @@ impl SyncController {
             video,
             max_video_drift: 0.1,
             sync_check_interval: 0.016,
-            current_frame: Arc::new(Mutex::new(None)),
             stats: Mutex::new(StatsInner {
                 video_frames_dropped: 0,
                 total_sync_checks: 0,
                 drift_samples: VecDeque::new(),
                 max_drift_seen: 0.0,
-                frame_update_time: 0.0,
+                baseline_diff: None,
             }),
             running: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
@@ -114,40 +120,14 @@ impl SyncController {
             }
 
             if let Some(video) = &self.video {
-                if let Some(frame) = video.get_frame_for_time(audio_time) {
-                    let video_time = frame.timestamp;
-                    let audio_video_diff = audio_time - video_time;
-
-                    let should_drop = {
+                if let Some(frame) = video.get_latest_frame() {
+                    let raw_diff = audio_time - frame.timestamp;
+                    let drift = {
                         let mut stats = self.stats.lock().unwrap();
-                        stats.record_drift(audio_video_diff);
-                        audio_video_diff > self.max_video_drift
-                            || audio_video_diff < -self.max_video_drift
+                        let baseline = *stats.baseline_diff.get_or_insert(raw_diff);
+                        raw_diff - baseline
                     };
-
-                    if should_drop {
-                        let dropped = {
-                            let mut stats = self.stats.lock().unwrap();
-                            stats.video_frames_dropped += 1;
-                            stats.video_frames_dropped
-                        };
-                        if dropped % 100 == 0 {
-                            if audio_video_diff > 0.0 {
-                                println!(
-                                    "Frames dropped: {dropped} (video behind by {audio_video_diff:.3}s)"
-                                );
-                            } else {
-                                println!(
-                                    "Frames dropped: {dropped} (video ahead by {:.3}s)",
-                                    -audio_video_diff
-                                );
-                            }
-                        }
-                    } else {
-                        let mut current = self.current_frame.lock().unwrap();
-                        *current = Some(frame);
-                        self.stats.lock().unwrap().frame_update_time = now_secs();
-                    }
+                    self.stats.lock().unwrap().record_drift(drift);
                 }
             }
 
@@ -157,49 +137,38 @@ impl SyncController {
         println!("Sync loop stopped");
     }
 
-    #[allow(dead_code)]
-    pub fn get_current_frame(&self) -> Option<TimestampedFrame> {
-        self.current_frame.lock().unwrap().clone()
-    }
-
-    pub fn current_frame_meta(&self) -> Option<(u64, f64, u32, u32)> {
-        let current = self.current_frame.lock().unwrap();
-        current
-            .as_ref()
-            .map(|f| (f.frame_number, f.timestamp, f.width, f.height))
-    }
-
-    pub fn copy_current_frame_into(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        let current = self.current_frame.lock().unwrap();
-        let frame = current.as_ref()?;
-        out.clear();
-        out.extend_from_slice(frame.data.as_slice());
-        Some((frame.width, frame.height))
-    }
-
     pub fn get_sync_status(&self) -> SyncStatus {
         let audio_time = self.audio.get_audio_time();
         let mut video_time = 0.0;
         let mut audio_video_diff = 0.0;
-        if let Some(frame) = self.current_frame.lock().unwrap().as_ref() {
-            video_time = frame.timestamp;
-            audio_video_diff = audio_time - video_time;
+        let mut has_video = false;
+        if let Some(video) = &self.video {
+            if let Some(frame) = video.get_latest_frame() {
+                video_time = frame.timestamp;
+                has_video = true;
+                let raw_diff = audio_time - frame.timestamp;
+                let baseline = self.stats.lock().unwrap().baseline_diff;
+                audio_video_diff = raw_diff - baseline.unwrap_or(raw_diff);
+            }
         }
-        let audio_buffer_samples = self.audio.get_available_samples();
-        let video_buffer_frames = self
+        let (video_capture_fps, video_frames_dropped) = self
             .video
             .as_ref()
-            .map(|v| v.get_buffer_stats().buffer_size)
-            .unwrap_or(0);
-        let video_frames_dropped = self.stats.lock().unwrap().video_frames_dropped;
-        let is_synced = audio_video_diff.abs() <= self.max_video_drift;
+            .map(|v| {
+                let s = v.get_capture_stats();
+                (s.fps_actual, s.skipped_frames)
+            })
+            .unwrap_or((0.0, 0));
+        self.stats.lock().unwrap().video_frames_dropped = video_frames_dropped;
+        let audio_buffer_samples = self.audio.get_available_samples();
+        let is_synced = !has_video || audio_video_diff.abs() <= self.max_video_drift;
         SyncStatus {
             audio_time,
             video_time,
             audio_video_diff,
             video_frames_dropped,
             audio_buffer_samples,
-            video_buffer_frames,
+            video_capture_fps,
             is_synced,
         }
     }
@@ -211,9 +180,14 @@ impl SyncController {
         } else {
             stats.drift_samples.iter().sum::<f64>() / stats.drift_samples.len() as f64
         };
+        let video_frames_dropped = self
+            .video
+            .as_ref()
+            .map(|v| v.get_capture_stats().skipped_frames)
+            .unwrap_or(0);
         PerfStats {
             total_sync_checks: stats.total_sync_checks,
-            video_frames_dropped: stats.video_frames_dropped,
+            video_frames_dropped,
             avg_drift_ms: avg_drift * 1000.0,
             max_drift_ms: stats.max_drift_seen * 1000.0,
             current_fps: if self.sync_check_interval > 0.0 {
@@ -231,6 +205,7 @@ impl SyncController {
         stats.total_sync_checks = 0;
         stats.drift_samples.clear();
         stats.max_drift_seen = 0.0;
+        stats.baseline_diff = None;
     }
 
     pub fn set_audio_volume(&self, volume: f32) {
@@ -292,10 +267,10 @@ impl AVMonitor {
                     }
                 }
                 println!(
-                    "A/V Sync: {:+.1}ms Audio: {} samples Video: {} frames Dropped: {}",
+                    "A/V Sync: {:+.1}ms Audio: {} samples Video: {:.0}fps Dropped: {}",
                     status.audio_video_diff * 1000.0,
                     status.audio_buffer_samples,
-                    status.video_buffer_frames,
+                    status.video_capture_fps,
                     status.video_frames_dropped
                 );
                 std::thread::sleep(Duration::from_secs_f64(interval));
@@ -351,7 +326,7 @@ mod tests {
             total_sync_checks: 0,
             drift_samples: VecDeque::new(),
             max_drift_seen: 0.0,
-            frame_update_time: 0.0,
+            baseline_diff: None,
         };
         for i in 0..250 {
             stats.record_drift(0.001 * i as f64);
@@ -360,5 +335,27 @@ mod tests {
         let first: f64 = stats.drift_samples[0];
         assert!((first - 0.150).abs() < 1e-9);
         assert!((stats.max_drift_seen - 0.249).abs() < 1e-9);
+    }
+
+    #[test]
+    fn baseline_gets_locked_on_first_sample() {
+        let mut stats = StatsInner {
+            video_frames_dropped: 0,
+            total_sync_checks: 0,
+            drift_samples: VecDeque::new(),
+            max_drift_seen: 0.0,
+            baseline_diff: None,
+        };
+        // primer diff crudo con offset de relojes de +1.5s → drift 0
+        let raw = 1.5;
+        let drift = {
+            let baseline = *stats.baseline_diff.get_or_insert(raw);
+            raw - baseline
+        };
+        assert!((drift).abs() < 1e-9);
+        // después el offset constante no cuenta como drift
+        let raw2 = 1.52;
+        let drift2 = raw2 - stats.baseline_diff.unwrap();
+        assert!((drift2 - 0.02).abs() < 1e-9);
     }
 }

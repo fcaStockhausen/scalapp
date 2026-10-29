@@ -41,15 +41,37 @@ nokhwa (poll) → decode RgbFormat (CPU) → VecDeque 120 frames → pull_frame 
 
 ## Plan de mejora (en orden de relación costo/beneficio)
 
-### Fase 1 — Medir y desatorar (barato)
-- [ ] Contador de fps del RENDERER (frames pintados/s) junto al de
+### Fase 1 — Medir y desatorar (barato) — ✅ HECHA (29/10)
+- [x] Contador de fps del RENDERER (frames pintados/s) junto al de
       captura. Sin esto seguimos adivinando dónde mueren los frames.
-- [ ] Cambiar la cola por **single-slot latest-wins** (ArcSwap o
-      Mutex<Option<Arc<Frame>>>): el renderer toma SIEMPRE el último;
-      latencia de cola = 0 por construcción.
-- [ ] Pedir formato exacto al dispositivo (1080p60), no
+- [x] Cambiar la cola por **single-slot latest-wins**
+      (`Mutex<Option<Arc<Frame>>>`): el renderer toma SIEMPRE el último;
+      latencia de cola = 0 por construcción. Con contador de frames
+      *skipped* (sobrescritos sin mostrarse) y *frame age* (ms entre
+      timestamp de captura y ahora) en el panel de stats.
+- [x] Pedir formato exacto al dispositivo (1080p60), no
       AbsoluteHighestResolution.
-- [ ] `request_repaint_after(8ms)` como parche mientras llega Fase 2.
+- [x] `request_repaint_after(8ms)` como parche mientras llega Fase 2.
+
+**Resultado medido (MS2131):** captura 1920x1080@**60fps reales**
+(antes negociaba 30), drift A/V +3..13ms, skipped estable en ~10
+(solo warmup) → el renderer consume los 60fps. Conversión RGB→RGBA en
+buffer reutilizado (adiós alloc de 8.3MB/frame).
+
+**Hallazgos de terreno (Fase 1):**
+- La MS2131 expone 1920x1080@60 como **YUYV**: macOS NO lista sus
+  modos MJPEG. El pedido exacto va con fourcc YUYV (nokhwa's `set_all`
+  casa solo resolución+fps, pero `Closest` filtra por fourcc y muere
+  con MJPEG).
+- El orden de dispositivos de AVFoundation **cambia entre sesiones de
+  discovery dentro del mismo proceso**: `query()` e `Camera::new(Index)`
+  pueden ver órdenes distintos. Solución: abrir por **uniqueID**
+  (`CameraIndex::String`), deterministic. El índice quedó solo para
+  `--video-device N` explícito (con escaneo de respaldo).
+- Un proceso que queda vivo con la capturadora abierta deja el
+  dispositivo en "Lock Rejected" para todos los demás (nokhwa no libera
+  limpio en todos los paths). Síntoma: `set_all` falla con
+  `lockForConfiguration`. Matar el proceso libera.
 
 ### Fase 2 — Push en vez de poll
 - [ ] Reemplazar nokhwa por **AVFoundation con delegate**
@@ -70,9 +92,12 @@ nokhwa (poll) → decode RgbFormat (CPU) → VecDeque 120 frames → pull_frame 
 ## Notas del terreno
 - La unidad (MS2131) es marginal: renegociaciones de formato la
   estresan. Menos cambios de modo = mejor (pedir UN formato y no
-  tocarlo más es también política de salud del hardware).
-- El autodetect de video (devices.rs) enumera 2560x1440@30 como
-  "primera" — cuidado al elegir formato por defecto.
+  tocarlo más es también política de salud del hardware). El probe del
+  autodetect ahora pide el mismo modo exacto que usará la captura, así
+  el open de la captura no renegocia nada.
+- ~~El autodetect de video (devices.rs) enumera 2560x1440@30 como
+  "primera"~~ Resuelto en Fase 1: autodetect por query() + uniqueID,
+  pidiendo 1080p60 exacto (reporta "USB3 Video 1920x1080@60fps").
 - audio.rs/passthrough.rs quedaron como referencia de motor probado
   (deriva compensada, watchdog, colchón adaptativo) — el video puede
   copiar el patrón de latest-wins del consumer.

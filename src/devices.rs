@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host};
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType};
+use nokhwa::utils::{
+    ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
+};
 use nokhwa::{query, Camera};
 
 #[derive(Clone)]
@@ -16,6 +18,9 @@ pub struct AudioDevInfo {
 #[allow(dead_code)]
 pub struct VideoCandidate {
     pub id: u32,
+    /// uniqueID de AVFoundation: la forma determinista de reabrir el
+    /// dispositivo (el orden de índices cambia entre sesiones de discovery).
+    pub unique_id: String,
     pub name: String,
     pub width: u32,
     pub height: u32,
@@ -112,12 +117,63 @@ pub fn auto_detect_audio() -> Vec<AudioDevInfo> {
     candidates
 }
 
+/// Sondea un dispositivo por uniqueID (identidad estable). Pide primero el
+/// modo de monitoreo exacto (1080p60): si el dispositivo lo soporta, es el
+/// modo que usará la captura y el probe no deja negociado otro formato
+/// (salud de la MS2131).
+pub fn probe_camera_by_id(unique_id: &str) -> Option<(u32, u32, f32, String)> {
+    let index = CameraIndex::String(unique_id.to_string());
+    let exact = CameraFormat::new_from(1920, 1080, FrameFormat::YUYV, 60);
+    if let Ok(camera) = Camera::new(
+        index.clone(),
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact)),
+    ) {
+        let resolution = camera.resolution();
+        return Some((
+            resolution.width_x,
+            resolution.height_y,
+            camera.frame_rate() as f32,
+            camera.info().human_name().to_string(),
+        ));
+    }
+    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
+    let camera = Camera::new(index, requested).ok()?;
+    let resolution = camera.resolution();
+    Some((
+        resolution.width_x,
+        resolution.height_y,
+        camera.frame_rate() as f32,
+        camera.info().human_name().to_string(),
+    ))
+}
+
 pub fn probe_camera(index: u32) -> Option<(u32, u32, f32)> {
+    probe_camera_by_index(index).map(|(w, h, fps, _)| (w, h, fps))
+}
+
+fn probe_camera_by_index(index: u32) -> Option<(u32, u32, f32, String)> {
+    let exact = CameraFormat::new_from(1920, 1080, FrameFormat::YUYV, 60);
+    if let Ok(camera) = Camera::new(
+        CameraIndex::Index(index),
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact)),
+    ) {
+        let resolution = camera.resolution();
+        return Some((
+            resolution.width_x,
+            resolution.height_y,
+            camera.frame_rate() as f32,
+            camera.info().human_name().to_string(),
+        ));
+    }
     let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
     let camera = Camera::new(CameraIndex::Index(index), requested).ok()?;
     let resolution = camera.resolution();
-    let fps = camera.frame_rate() as f32;
-    Some((resolution.width_x, resolution.height_y, fps))
+    Some((
+        resolution.width_x,
+        resolution.height_y,
+        camera.frame_rate() as f32,
+        camera.info().human_name().to_string(),
+    ))
 }
 
 fn system_profiler_camera_names() -> Vec<String> {
@@ -147,15 +203,32 @@ fn system_profiler_camera_names() -> Vec<String> {
     names
 }
 
-fn camera_names_from_query() -> Vec<(u32, String)> {
+/// Enumeración por query(): índice, nombre y uniqueID de AVFoundation en
+/// una sola sesión — uniqueID es la identidad estable para reabrir (el
+/// orden de índices cambia entre sesiones de discovery).
+fn query_devices_full() -> Vec<(u32, String, String)> {
     query(ApiBackend::Auto)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|info| match info.index() {
-            CameraIndex::Index(i) => Some((*i, info.human_name())),
+            CameraIndex::Index(i) => Some((*i, info.human_name().to_string(), info.misc().to_string())),
             _ => None,
         })
         .collect()
+}
+
+fn is_capture_device_name(name_lower: &str) -> bool {
+    ["hdmi", "capture", "usb", "elgato", "magewell", "blackmagic",
+        "avermedia", "hdmic", "video", "usb-video", "composite", "component"]
+        .iter()
+        .any(|k| name_lower.contains(k))
+}
+
+fn is_excluded_device_name(name_lower: &str) -> bool {
+    ["iphone", "facetime", "built-in", "webcam", "camera",
+        "isight", "macbook", "imac", "obs virtual"]
+        .iter()
+        .any(|e| name_lower.contains(e))
 }
 
 pub fn auto_detect_video() -> Vec<VideoCandidate> {
@@ -164,47 +237,78 @@ pub fn auto_detect_video() -> Vec<VideoCandidate> {
     let mut candidates: Vec<VideoCandidate> = Vec::new();
 
     if cfg!(target_os = "macos") {
-        let names = system_profiler_camera_names();
-        let query_names = camera_names_from_query();
-        for name in names {
+        // 1) Fuente primaria: query() del mismo backend que usará la
+        //    captura. Identidad por uniqueID, no por posición.
+        for (index, name, unique_id) in query_devices_full() {
             let name_lower = name.to_lowercase();
-            let is_capture = ["hdmi", "capture", "usb", "elgato", "magewell", "blackmagic",
-                "avermedia", "hdmic", "video", "usb-video", "composite", "component"]
-                .iter()
-                .any(|k| name_lower.contains(k));
-            let is_excluded = ["iphone", "facetime", "built-in", "webcam", "camera",
-                "isight", "macbook", "imac"]
-                .iter()
-                .any(|e| name_lower.contains(e));
-            if !is_capture || is_excluded {
+            if !is_capture_device_name(&name_lower) || is_excluded_device_name(&name_lower) {
                 continue;
             }
-            for i in 0..4u32 {
-                if let Some((w, h, fps)) = probe_camera(i) {
-                    if w >= 1280 && h >= 720 {
-                        let device_name = format!("{name} {w}x{h}@{fps:.0}fps");
-                        if !candidates.iter().any(|c| c.id == i) {
+            if let Some((w, h, fps, _dev_name)) = probe_camera_by_id(&unique_id) {
+                if w >= 1280 && h >= 720 {
+                    let device_name = format!("{name} {w}x{h}@{fps:.0}fps");
+                    println!("  -> Encontrado: {device_name} (ID: {index})");
+                    candidates.push(VideoCandidate {
+                        id: index,
+                        unique_id,
+                        name: device_name,
+                        width: w,
+                        height: h,
+                        fps,
+                    });
+                }
+            }
+        }
+
+        // 2) Fallback: nombres de system_profiler + sondeo posicional
+        if candidates.is_empty() {
+            for name in system_profiler_camera_names() {
+                let name_lower = name.to_lowercase();
+                if !is_capture_device_name(&name_lower) || is_excluded_device_name(&name_lower) {
+                    continue;
+                }
+                for i in 0..4u32 {
+                    if let Some((w, h, fps, dev_name)) = probe_camera_by_index(i) {
+                        let dev_lower = dev_name.to_lowercase();
+                        if w >= 1280
+                            && h >= 720
+                            && (dev_lower.contains(&name_lower) || name_lower.contains(&dev_lower))
+                            && !candidates.iter().any(|c| c.id == i)
+                        {
+                            let device_name = format!("{name} {w}x{h}@{fps:.0}fps");
                             println!("  -> Encontrado: {device_name} (ID: {i})");
-                            candidates.push(VideoCandidate { id: i, name: device_name, width: w, height: h, fps });
+                            candidates.push(VideoCandidate {
+                                id: i,
+                                unique_id: format!("idx:{i}"),
+                                name: device_name,
+                                width: w,
+                                height: h,
+                                fps,
+                            });
+                            break;
                         }
-                        break;
                     }
                 }
             }
         }
-        let _ = query_names;
     }
 
+    // 3) Fallback genérico: cualquier dispositivo con resolución HDMI
     if candidates.is_empty() {
         println!("Buscando por capacidades (dispositivos con resolución HDMI)...");
         for i in 0..5u32 {
-            if let Some((w, h, fps)) = probe_camera(i) {
+            if let Some((w, h, fps, dev_name)) = probe_camera_by_index(i) {
                 if w >= 1280 && h >= 720 && !(w == 1280 && h == 720 && fps < 31.0) {
-                    let priority = fps + (w as f32 / 1000.0);
                     let device_name = format!("Capturadora_Generica_{i} {w}x{h}@{fps:.0}fps");
                     println!("  -> Encontrado: {device_name} (ID: {i})");
-                    candidates.push(VideoCandidate { id: i, name: device_name, width: w, height: h, fps, });
-                    let _ = priority;
+                    candidates.push(VideoCandidate {
+                        id: i,
+                        unique_id: format!("idx:{i}"),
+                        name: format!("{device_name} ({dev_name})"),
+                        width: w,
+                        height: h,
+                        fps,
+                    });
                 }
             }
         }
