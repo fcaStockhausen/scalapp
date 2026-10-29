@@ -1,0 +1,5 @@
+opencv-python>=4.8.0
+sounddevice>=0.4.5
+numpy>=1.24.0
+PyQt6>=6.5.0
+av>=10.0.0

@@ -1,0 +1,18 @@
+[package]
+name = "scalapp"
+version = "2.0.0"
+edition = "2021"
+description = "ScalApp AV Monitor - Latency Tolerant HDMI USB capture, Rust port"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.15"
+eframe = "0.29"
+nokhwa = { version = "0.10", features = ["input-native"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+ctrlc = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
