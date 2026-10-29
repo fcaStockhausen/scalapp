@@ -64,6 +64,101 @@ fn write_ring(ring: &mut Ring, data: &[f32], channels: usize, capacity_frames: u
     ring.write = end % capacity_frames;
 }
 
+/// Notch biquad (RBJ cookbook), forma directa II transpuesta.
+struct NotchCoeffs {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+/// Cadena de filtrado del hum del chip (--notch-hum): cuando streamea
+/// video, la MS2131 acopla su refresco vertical al path de audio —
+/// medido 29/10 con resolución fina: tono a 60.06 Hz + armónicos
+/// (120/180) + subarmónico ~30 Hz, +7dB sobre el nivel audio-only.
+/// Cadena: high-pass 45 Hz (rumor 28-35 Hz) + notches a 60/120/180.
+pub struct NotchBank {
+    fs: f32,
+    coeffs: Vec<NotchCoeffs>,
+    /// [biquad][canal] = [w1, w2]
+    states: Vec<[[f32; 2]; 2]>,
+}
+
+impl NotchBank {
+    pub fn new(sample_rate: u32, freqs: &[f32], q: f32) -> Self {
+        let coeffs = freqs
+            .iter()
+            .map(|&f0| {
+                let w0 = 2.0 * std::f32::consts::PI * f0 / sample_rate as f32;
+                let alpha = w0.sin() / (2.0 * q);
+                let a0 = 1.0 + alpha;
+                NotchCoeffs {
+                    b0: 1.0 / a0,
+                    b1: (-2.0 * w0.cos()) / a0,
+                    b2: 1.0 / a0,
+                    a1: (-2.0 * w0.cos()) / a0,
+                    a2: (1.0 - alpha) / a0,
+                }
+            })
+            .collect();
+        let states = vec![[[0.0f32; 2]; 2]; freqs.len()];
+        Self {
+            fs: sample_rate as f32,
+            coeffs,
+            states,
+        }
+    }
+
+    /// Cadena completa anti-hum: HP 48 Hz ×2 (4º orden: el rumor del chip
+    /// vive en 28-38 Hz y un solo biquad lo baja poco) + notches
+    /// 60.06/120.12/180.18 (frecuencias medidas del acople; Q=12 tolera
+    /// deriva del cristal).
+    pub fn hum_filter(sample_rate: u32) -> Self {
+        let mut bank = Self::new(sample_rate, &[60.06, 120.12, 180.18], 12.0);
+        bank.push_highpass(48.0);
+        bank.push_highpass(48.0);
+        bank
+    }
+
+    fn push_highpass(&mut self, f0: f32) {
+        let w0 = 2.0 * std::f32::consts::PI * f0 / self.fs;
+        let alpha = w0.sin() / (2.0f32 * std::f32::consts::SQRT_2);
+        let a0 = 1.0 + alpha;
+        let cosw = w0.cos();
+        self.coeffs.push(NotchCoeffs {
+            b0: ((1.0 + cosw) / 2.0) / a0,
+            b1: (-(1.0 + cosw)) / a0,
+            b2: ((1.0 + cosw) / 2.0) / a0,
+            a1: (-2.0 * cosw) / a0,
+            a2: (1.0 - alpha) / a0,
+        });
+        self.states.push([[0.0f32; 2]; 2]);
+    }
+
+    #[inline]
+    fn process(&mut self, ch: usize, x: f32) -> f32 {
+        let mut y = x;
+        for (i, c) in self.coeffs.iter().enumerate() {
+            let s = &mut self.states[i][ch];
+            let out = c.b0 * y + s[0];
+            s[0] = c.b1 * y - c.a1 * out + s[1];
+            s[1] = c.b2 * y - c.a2 * out;
+            y = out;
+        }
+        y
+    }
+
+    /// Filtra un buffer interleaved estéolo in-place.
+    pub(crate) fn process_interleaved(&mut self, buf: &mut [f32]) {
+        for frame in buf.chunks_exact_mut(2) {
+            let (l, r) = (frame[0], frame[1]);
+            frame[0] = self.process(0, l);
+            frame[1] = self.process(1, r);
+        }
+    }
+}
+
 pub struct AudioStreams {
     input: Arc<Mutex<Option<Stream>>>,
     playback_output: Option<Stream>,
@@ -176,6 +271,7 @@ impl AudioPlayback {
         sample_rate: u32,
         block_size: u32,
         cushion_ms: Arc<AtomicU64>,
+        notch_hum: bool,
     ) -> Result<Stream> {
         // tope de seguridad por tiempo (~0.75s) — con deriva compensada
         // la cola vive cerca del objetivo, no del tope
@@ -243,10 +339,29 @@ impl AudioPlayback {
         let drift_out = drift.clone();
         let diag_out = diag.clone();
         let cushion_out = cushion_ms.clone();
+        // Notch del hum (59.94/119.88/179.82 — el refresco vertical del
+        // chip acoplado al audio con video activo) + grabador de SALIDA
+        // para validación (SCALAPP_REC_OUT, post-notch).
+        let notch_out = notch_hum.then(|| Arc::new(Mutex::new(NotchBank::hum_filter(sample_rate))));
+        let notch_cb = notch_out.clone();
+        let rec_out_file = std::env::var("SCALAPP_REC_OUT").ok().map(|path| {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("SCALAPP_REC_OUT {path}: {e}"));
+            println!("[rec] grabando salida post-notch a {path}");
+            Arc::new(Mutex::new(f))
+        });
+        let rec_out_cb = rec_out_file.clone();
         println!(
             "Audio playback device: {}",
             device.name().unwrap_or_else(|_| "?".into())
         );
+        if notch_hum {
+            println!("✓ Filtro anti-hum activo: HP 48Hz x2 + notch 60.06/120.12/180.18 Hz");
+        }
         let stream = device
             .build_output_stream(
                 &config,
@@ -364,6 +479,17 @@ impl AudioPlayback {
                         );
                         dg.last_underrun_log = Instant::now();
                     }
+                    // notch del hum + grabación de salida (validación)
+                    if let Some(nb) = &notch_cb {
+                        let mut bank = nb.lock().unwrap();
+                        bank.process_interleaved(out);
+                    }
+                    if let Some(rec) = &rec_out_cb {
+                        use std::io::Write;
+                        let bytes: Vec<u8> =
+                            out.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        let _ = rec.lock().unwrap().write_all(&bytes);
+                    }
                 },
                 |err| eprintln!("Audio output status: {err}"),
                 None,
@@ -441,6 +567,8 @@ pub struct AudioCapture {
     /// El colchón adaptativo puede elevarlo por encima si el device
     /// dropea audio (MS2131: gaps ~100-220ms cada ~1min con video activo).
     cushion_base_ms: AtomicU64,
+    /// Notch del hum del chip (59.94/120/180 Hz con video activo).
+    notch_hum: std::sync::atomic::AtomicBool,
 }
 
 impl AudioCapture {
@@ -472,12 +600,18 @@ impl AudioCapture {
             playback: Arc::new(Mutex::new(None)),
             volume: Mutex::new(0.5),
             cushion_base_ms: AtomicU64::new(0),
+            notch_hum: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Fija el colchón base del playback (--audio-cushion-ms).
     pub fn set_cushion_base_ms(&self, ms: u64) {
         self.cushion_base_ms.store(ms.clamp(20, 500), Ordering::Relaxed);
+    }
+
+    /// Activa el notch del hum (--notch-hum).
+    pub fn set_notch_hum(&self, on: bool) {
+        self.notch_hum.store(on, Ordering::Relaxed);
     }
 
     pub fn start(&self) -> Result<AudioStreams> {
@@ -556,6 +690,19 @@ impl AudioCapture {
         let last_input_ms = Arc::new(AtomicU64::new(0));
         let last_input_ms_wd = last_input_ms.clone();
         let cushion_in = cushion_ms.clone();
+        // Grabador de diagnóstico: SCALAPP_REC=/path/dump.f32 graba el
+        // audio CAPTURADO (pre-playback) como f32 LE interleaved. Solo
+        // para análisis (escritura en callback RT = no productivo).
+        let rec_file = std::env::var("SCALAPP_REC").ok().map(|path| {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("SCALAPP_REC {path}: {e}"));
+            println!("[rec] grabando captura cruda a {path}");
+            Arc::new(Mutex::new(f))
+        });
 
         // Constructor extraído: el watchdog reconstruye la entrada con los
         // MISMOS Arcs. `move`, dueño de sus capturas; vive en main thread
@@ -567,6 +714,7 @@ impl AudioCapture {
         let last_block_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let last_block_len_in = last_block_len.clone();
         let cushion_gap = cushion_in.clone();
+        let rec_in = rec_file.clone();
         let t0_input = Instant::now();
         let make_input: Box<dyn Fn() -> Result<Stream>> = Box::new(move || {
             let ring = ring.clone();
@@ -575,6 +723,7 @@ impl AudioCapture {
             let last_input_ms = last_input_ms.clone();
             let last_block_len = last_block_len_in.clone();
             let cushion_gap = cushion_gap.clone();
+            let rec_cb = rec_in.clone();
             let config = config_for_builder.clone();
             device_for_builder
                 .build_input_stream(
@@ -613,6 +762,12 @@ impl AudioCapture {
                             );
                         }
                         let frames = data.len() / channels;
+                        if let Some(rec) = &rec_cb {
+                            use std::io::Write;
+                            let bytes: Vec<u8> =
+                                data.iter().flat_map(|s| s.to_le_bytes()).collect();
+                            let _ = rec.lock().unwrap().write_all(&bytes);
+                        }
                         write_ring(&mut ring.lock().unwrap(), data, channels, capacity);
                         total.fetch_add(frames as u64, Ordering::Relaxed);
                         if let Some(p) = playback_slot.lock().unwrap().as_ref() {
@@ -645,7 +800,12 @@ impl AudioCapture {
             playback.set_volume(volume);
             // bloque de salida pequeño también: aporta un bloque de latencia
             let out_bs = self.block_size.min(512);
-            match playback.start(sample_rate, out_bs, cushion_ms.clone()) {
+            match playback.start(
+                sample_rate,
+                out_bs,
+                cushion_ms.clone(),
+                self.notch_hum.load(Ordering::Relaxed),
+            ) {
                 Ok(out_stream) => {
                     *self.playback.lock().unwrap() = Some(playback);
                     playback_output = Some(out_stream);
@@ -827,5 +987,33 @@ mod tests {
         write_ring(&mut ring, &[1.0, 2.0, 3.0], 1, 4);
         ring.read = 1;
         assert_eq!(ring.available(4), 2);
+    }
+
+    #[test]
+    fn notch_kills_refresh_tone_and_passes_the_rest() {
+        // el hum medido: tono a ~60 Hz con armónicos + rumor ~30 Hz
+        let fs = 48000u32;
+        let mut bank = NotchBank::hum_filter(fs);
+        let n = fs as usize; // 1s
+        let sine = |f: f32, t: usize| (2.0 * std::f32::consts::PI * f * t as f32 / fs as f32).sin();
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        // 60 Hz → debe atenuarse fuerte (>20dB)
+        let mut x: Vec<f32> = (0..n).map(|t| sine(60.0, t)).collect();
+        let rms_in = rms(&x);
+        bank.process_interleaved(&mut x);
+        let attn_db = 20.0 * (rms_in / rms(&x[n / 2..]).max(1e-12)).log10();
+        assert!(attn_db > 20.0, "atenuación 60Hz insuficiente: {attn_db:.1} dB");
+        // 30 Hz (rumor) → el HP lo mata
+        let mut x: Vec<f32> = (0..n).map(|t| sine(30.0, t)).collect();
+        let rms_in = rms(&x);
+        bank.process_interleaved(&mut x);
+        let attn30 = 20.0 * (rms_in / rms(&x[n / 2..]).max(1e-12)).log10();
+        assert!(attn30 > 12.0, "atenuación 30Hz insuficiente: {attn30:.1} dB");
+        // 200 Hz → debe pasar casi intacto (±0.5dB)
+        let mut y: Vec<f32> = (0..n).map(|t| sine(200.0, t)).collect();
+        let rms_in = rms(&y);
+        bank.process_interleaved(&mut y);
+        let gain_db = 20.0 * (rms(&y[n / 2..]) / rms_in).log10();
+        assert!(gain_db.abs() < 0.5, "ganancia a 200Hz: {gain_db:.2} dB");
     }
 }

@@ -362,22 +362,28 @@ pub fn auto_detect_video() -> Vec<VideoCandidate> {
         }
     }
 
-    // 3) Fallback genérico: cualquier dispositivo con resolución HDMI
+    // 3) Fallback genérico: cualquier dispositivo con resolución HDMI.
+    //    Filtrar por NOMBRE antes de abrir (query no enciende la cámara:
+    //    abrir la FaceTime para excluirla prende su luz).
     if candidates.is_empty() {
         println!("Buscando por capacidades (dispositivos con resolución HDMI)...");
-        for i in 0..5u32 {
-            if let Some((w, h, fps, dev_name)) = probe_camera_by_index(i) {
+        for (index, name, unique_id) in query_devices_full() {
+            let name_lower = name.to_lowercase();
+            if is_excluded_device_name(&name_lower) {
+                continue;
+            }
+            if let Some((w, h, fps, dev_name)) = probe_camera_by_id(&unique_id) {
                 let dev_lower = dev_name.to_lowercase();
                 if w >= 1280
                     && h >= 720
                     && !(w == 1280 && h == 720 && fps < 31.0)
                     && !is_excluded_device_name(&dev_lower)
                 {
-                    let device_name = format!("Capturadora_Generica_{i} {w}x{h}@{fps:.0}fps");
-                    println!("  -> Encontrado: {device_name} (ID: {i})");
+                    let device_name = format!("Capturadora_Generica_{index} {w}x{h}@{fps:.0}fps");
+                    println!("  -> Encontrado: {device_name} (ID: {index})");
                     candidates.push(VideoCandidate {
-                        id: i,
-                        unique_id: format!("idx:{i}"),
+                        id: index,
+                        unique_id,
                         name: format!("{device_name} ({dev_name})"),
                         width: w,
                         height: h,

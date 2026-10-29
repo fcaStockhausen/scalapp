@@ -113,6 +113,8 @@ struct PassthroughV4 {
     /// reconstruye el stream de entrada (revive tras la muerte por
     /// doble cliente). 0 = watchdog desactivado.
     stall_ms: u64,
+    /// Notch del hum del chip (--notch-hum): 59.94/120/180 Hz.
+    notch_hum: bool,
     buffer: Arc<Mutex<VecDeque<Vec<f32>>>>,
     virtual_buffer: Arc<Mutex<VecDeque<Vec<f32>>>>,
     volume: Arc<AtomicF32>,
@@ -129,6 +131,7 @@ impl PassthroughV4 {
             virtual_out_name: None,
             delay_ms: 0,
             stall_ms: 0,
+            notch_hum: false,
             buffer: Arc::new(Mutex::new(VecDeque::new())),
             virtual_buffer: Arc::new(Mutex::new(VecDeque::new())),
             volume: Arc::new(AtomicF32::new(volume)),
@@ -144,6 +147,11 @@ impl PassthroughV4 {
     fn with_cushion(mut self, delay_ms: u32, stall_ms: u64) -> Self {
         self.delay_ms = delay_ms;
         self.stall_ms = stall_ms;
+        self
+    }
+
+    fn with_notch_hum(mut self, on: bool) -> Self {
+        self.notch_hum = on;
         self
     }
 
@@ -203,6 +211,18 @@ impl PassthroughV4 {
         let last_input_ms = Arc::new(AtomicU64::new(0));
         let last_input_ms_in = last_input_ms.clone();
         let sample_rate_for_target = default_cfg.sample_rate().0;
+        // Grabador de diagnóstico: SCALAPP_REC=/path/dump.f32 graba el
+        // audio CAPTURADO (pre-playback) como f32 LE interleaved.
+        let rec_file = std::env::var("SCALAPP_REC").ok().map(|path| {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("SCALAPP_REC {path}: {e}"));
+            println!("[rec] grabando captura cruda a {path}");
+            Arc::new(Mutex::new(f))
+        });
 
         // Constructor extraido: el watchdog reconstruye la entrada con los
         // MISMOS Arcs (misma cola, mismo volumen) cuando Discord la mata.
@@ -216,11 +236,18 @@ impl PassthroughV4 {
             let first_in_c = first_in_c.clone();
             let target_fill_in = target_fill_in.clone();
             let last_input_ms_in = last_input_ms_in.clone();
+            let rec_cb = rec_file.clone();
             let config = config_for_builder.clone();
             input
                 .build_input_stream(
                     &config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if let Some(rec) = &rec_cb {
+                            use std::io::Write;
+                            let bytes: Vec<u8> =
+                                data.iter().flat_map(|s| s.to_le_bytes()).collect();
+                            let _ = rec.lock().unwrap().write_all(&bytes);
+                        }
                         if first_in_c.swap(false, Ordering::Relaxed) {
                             println!("[diag] bloque ENTRADA: {} frames ({:.1}ms)",
                                      data.len() / channels_dbg,
@@ -303,6 +330,15 @@ impl PassthroughV4 {
             primed: false,
         }));
         let drift_out = drift.clone();
+        // Notch del hum (--notch-hum): el refresco vertical del chip se
+        // acopla al audio cuando streamea video (60/120/180 Hz).
+        let notch_out = self
+            .notch_hum
+            .then(|| Arc::new(Mutex::new(crate::audio::NotchBank::hum_filter(sample_rate))));
+        let notch_cb = notch_out.clone();
+        if self.notch_hum {
+            println!("  Filtro anti-hum: HP 48Hz x2 + notch 60.06/120.12/180.18 Hz");
+        }
         let output_stream = output
             .build_output_stream(
                 &config,
@@ -375,6 +411,10 @@ impl PassthroughV4 {
                     if consumed > 0 && consumed < d.block.len() {
                         d.block.drain(..consumed);
                         d.frac_pos -= (consumed / channels) as f32;
+                    }
+                    if let Some(nb) = &notch_cb {
+                        let mut bank = nb.lock().unwrap();
+                        bank.process_interleaved(out);
                     }
                     blocks.fetch_add(1, Ordering::Relaxed);
                 },
@@ -551,6 +591,11 @@ impl PassthroughWithVolume {
 
     pub fn with_virtual_out(mut self, name: Option<String>) -> Self {
         self.passthrough = self.passthrough.with_virtual_out(name);
+        self
+    }
+
+    pub fn with_notch_hum(mut self, on: bool) -> Self {
+        self.passthrough = self.passthrough.with_notch_hum(on);
         self
     }
 

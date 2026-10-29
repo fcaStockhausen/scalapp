@@ -60,6 +60,9 @@ scalapp --video-device 1 --monitor --latency 1.0
 # con video activo; el colchón adaptativo lo cubre solo, esto fija la base)
 scalapp --video --audio-cushion-ms 150
 
+# Filtro anti-hum del chip (tono ~60Hz + rumor con video streameando)
+scalapp --video --notch-hum
+
 # Utilidades
 scalapp --list-devices           # lista capturadoras HDMI detectadas
 scalapp --test-audio             # prueba dispositivos con detección de señal

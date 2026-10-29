@@ -189,6 +189,12 @@ struct Args {
     #[arg(long = "audio-cushion-ms", default_value_t = 0)]
     audio_cushion_ms: u64,
 
+    /// Notch del hum del chip: con video streameando, la MS2131 acopla su
+    /// refresco vertical al audio (tono puro ~60 Hz + armónicos 120/180,
+    /// medido +7dB). Filtra 59.94/119.88/179.82 Hz con Q alto.
+    #[arg(long = "notch-hum", default_value_t = false)]
+    notch_hum: bool,
+
     #[arg(long)]
     ultra_low_latency: bool,
 
@@ -269,7 +275,7 @@ fn run(args: Args) -> Result<()> {
 
     if direct_passthrough {
         run_direct_passthrough(audio_device_index, args.block_size, args.virtual_out.clone(),
-                               args.delay_ms, args.stall_ms)?;
+                               args.delay_ms, args.stall_ms, args.notch_hum)?;
         return Ok(());
     }
 
@@ -304,6 +310,7 @@ fn run(args: Args) -> Result<()> {
         audio_capture.set_cushion_base_ms(args.audio_cushion_ms);
         println!("✓ Audio cushion base: {}ms", args.audio_cushion_ms);
     }
+    audio_capture.set_notch_hum(args.notch_hum);
     println!(
         "✓ Audio capture initialized: {}Hz, {} channels",
         args.audio_rate, 2
@@ -487,7 +494,7 @@ fn run(args: Args) -> Result<()> {
 }
 
 fn run_direct_passthrough(audio_device_index: Option<usize>, block_size_arg: Option<u32>, virtual_out: Option<String>,
-                          delay_ms: u32, stall_ms: u64) -> Result<()> {
+                          delay_ms: u32, stall_ms: u64, notch_hum: bool) -> Result<()> {
     let block_size = block_size_arg.unwrap_or(256);
     let block_ms = (block_size as f64 / 44100.0) * 1000.0;
 
@@ -505,7 +512,8 @@ fn run_direct_passthrough(audio_device_index: Option<usize>, block_size_arg: Opt
 
     let passthrough = PassthroughWithVolume::new(44100, 2, block_size, 0.3)
         .with_cushion(delay_ms, stall_ms)
-        .with_virtual_out(virtual_out);
+        .with_virtual_out(virtual_out)
+        .with_notch_hum(notch_hum);
     let mut streams = passthrough.start(audio_device_index)?;
     println!("✓ Direct passthrough V4 started\n");
 
