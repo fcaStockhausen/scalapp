@@ -374,7 +374,7 @@ fn run(args: Args) -> Result<()> {
     );
     println!("{}\n", "=".repeat(50));
 
-    let mut audio_streams = audio_capture.start()?;
+    let audio_streams = std::sync::Arc::new(std::sync::Mutex::new(audio_capture.start()?));
     println!("✓ Audio capture started");
 
     if let Some(video) = &video_capture {
@@ -431,7 +431,8 @@ fn run(args: Args) -> Result<()> {
             .as_ref()
             .map(|v| v.fps as f32)
             .unwrap_or(60.0);
-        renderer::run(sync_controller.clone(), target_fps).map_err(|e| anyhow::anyhow!("{e}"))
+        renderer::run(sync_controller.clone(), target_fps, Some(audio_streams.clone()))
+            .map_err(|e| anyhow::anyhow!("{e}"))
     };
 
     println!("\nStopping AV Monitor...");
@@ -456,7 +457,7 @@ fn run(args: Args) -> Result<()> {
         println!("✓ Video capture stopped");
     }
 
-    audio_streams.stop();
+    audio_streams.lock().unwrap().stop();
     audio_capture.stop();
     println!("✓ Audio capture stopped");
 

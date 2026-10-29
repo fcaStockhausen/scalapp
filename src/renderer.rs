@@ -4,6 +4,7 @@ use std::time::Duration;
 use eframe::egui;
 use egui::{Color32, FontId, pos2, vec2, Rect};
 
+use crate::audio::AudioStreams;
 use crate::sync::SyncController;
 
 pub struct RendererApp {
@@ -18,6 +19,7 @@ pub struct RendererApp {
     borderless: bool,
     target_fps: f32,
     status_text: String,
+    audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
 }
 
 impl RendererApp {
@@ -25,6 +27,7 @@ impl RendererApp {
         cc: &eframe::CreationContext<'_>,
         sync: Arc<SyncController>,
         target_fps: f32,
+        audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
     ) -> Self {
         let texture = cc.egui_ctx.load_texture(
             "video",
@@ -43,6 +46,7 @@ impl RendererApp {
             borderless: false,
             target_fps,
             status_text: "Initializing...".into(),
+            audio_streams,
         }
     }
 
@@ -149,6 +153,10 @@ impl RendererApp {
 
 impl eframe::App for RendererApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // parche de negociación: atender pedidos de rebuild del watchdog
+        if let Some(streams) = &self.audio_streams {
+            streams.lock().unwrap().poll_rebuild();
+        }
         let toggle_f = ctx.input(|i| i.key_pressed(egui::Key::F));
         let toggle_o = ctx.input(|i| i.key_pressed(egui::Key::O));
         let toggle_s = ctx.input(|i| i.key_pressed(egui::Key::S));
@@ -230,7 +238,11 @@ impl eframe::App for RendererApp {
     }
 }
 
-pub fn run(sync: Arc<SyncController>, target_fps: f32) -> eframe::Result<()> {
+pub fn run(
+    sync: Arc<SyncController>,
+    target_fps: f32,
+    audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
+) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
@@ -240,6 +252,6 @@ pub fn run(sync: Arc<SyncController>, target_fps: f32) -> eframe::Result<()> {
     eframe::run_native(
         "scalapp-av-monitor",
         options,
-        Box::new(move |cc| Ok(Box::new(RendererApp::new(cc, sync, target_fps)))),
+        Box::new(move |cc| Ok(Box::new(RendererApp::new(cc, sync, target_fps, audio_streams)))),
     )
 }

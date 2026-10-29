@@ -65,15 +65,75 @@ fn write_ring(ring: &mut Ring, data: &[f32], channels: usize, capacity_frames: u
 }
 
 pub struct AudioStreams {
-    input: Option<Stream>,
+    input: Arc<Mutex<Option<Stream>>>,
     playback_output: Option<Stream>,
+    // Parche de negociación (29/10): la entrada puede morir cuando el
+    // dispositivo renegocia (cambio de modo USB, etc.). El watchdog
+    // (solo atómicos) levanta la bandera; el MAIN thread (renderer)
+    // atiende via poll_rebuild().
+    rebuild_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    rebuild_next_ms: Arc<AtomicU64>,
+    rebuild_fn: Option<Box<dyn Fn() -> Result<Stream>>>,
+    wd_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    wd_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl AudioStreams {
     pub fn stop(&mut self) {
-        drop(self.input.take());
+        if let Some(f) = self.wd_stop.take() {
+            f.store(true, Ordering::Relaxed);
+        }
+        if let Some(h) = self.wd_handle.take() {
+            let _ = h.join();
+        }
+        drop(self.input.lock().unwrap().take());
         drop(self.playback_output.take());
         println!("Audio playback stopped");
+    }
+
+    /// Atiende pedidos de rebuild del watchdog. Llamar periódicamente
+    /// desde el main thread (el renderer lo bombea en cada frame).
+    pub fn poll_rebuild(&mut self) {
+        let flag = match &self.rebuild_flag {
+            Some(f) => f,
+            None => return,
+        };
+        if !flag.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = now_ms();
+        if now < self.rebuild_next_ms.load(Ordering::Relaxed) {
+            return;
+        }
+        flag.store(false, Ordering::Relaxed);
+        self.rebuild_next_ms.store(now + 2000, Ordering::Relaxed);
+        let make = match &self.rebuild_fn {
+            Some(m) => m,
+            None => return,
+        };
+        println!("[watchdog] reconstruyendo stream de audio...");
+        let old = self.input.lock().unwrap().take();
+        drop(old);
+        match make().and_then(|s| {
+            s.play().context("failed to restart audio input")?;
+            Ok(s)
+        }) {
+            Ok(s) => {
+                *self.input.lock().unwrap() = Some(s);
+                println!("[watchdog] entrada de audio reconstruida ✓");
+            }
+            Err(e) => {
+                eprintln!("[watchdog] fallo rebuild audio: {e:#} — reintento en 2s");
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -98,7 +158,7 @@ impl AudioPlayback {
         }
     }
 
-    pub fn start(&self, sample_rate: u32, block_size: u32) -> Result<Stream> {
+    pub fn start(&self, sample_rate: u32, block_size: u32, target_ms: f32) -> Result<Stream> {
         // tope de seguridad por tiempo (~0.75s) — con deriva compensada
         // la cola vive cerca del objetivo, no del tope
         self.cap_samples.store(
@@ -125,9 +185,9 @@ impl AudioPlayback {
             block: Vec<f32>,
             primed: bool,
         }
-        const TARGET_MS: f32 = 80.0;
+        let target_ms = target_ms.max(20.0);
         let target_samples =
-            (TARGET_MS / 1000.0 * sample_rate as f32) as usize * self.channels;
+            (target_ms / 1000.0 * sample_rate as f32) as usize * self.channels;
         let drift = Arc::new(Mutex::new(Drift {
             frac_pos: 0.0,
             block: Vec::new(),
@@ -312,8 +372,7 @@ impl AudioCapture {
         // Auditado 29/10 (port del fix 25/10 de passthrough.rs): la interfaz
         // de audio de la capturadora corre a su PROPIA tasa (48000Hz) y
         // renegocia tras cambios de modo USB. Forzar 44100 =
-        // "configuration not supported". Adoptamos la config REAL del
-        // dispositivo y buffer Default (CoreAudio elige el óptimo).
+        // "configuration not supported". Adoptamos la tasa REAL.
         let default_cfg = device
             .default_input_config()
             .context("no se pudo leer la config del dispositivo de entrada")?;
@@ -324,36 +383,94 @@ impl AudioCapture {
                 self.sample_rate
             );
         }
+
+        // Latencia mínima (29/10): el bloque de entrada define el piso del
+        // colchón (el consumidor sobrevive entre bloque y bloque). Pedimos
+        // bloques CHICOS con fallback: 256 → 512 → 1024 → Default.
+        // (El problema histórico era la TASA forzada, no el tamaño.)
+        let mut input_block: Option<(u32, bool)> = None;
+        let mut last_err = None;
+        for (bs, is_fixed) in [(256u32, true), (512, true), (1024, true)] {
+            let cfg = StreamConfig {
+                channels: self.channels as u16,
+                sample_rate: SampleRate(sample_rate),
+                buffer_size: BufferSize::Fixed(bs),
+            };
+            match device.build_input_stream(&cfg, |_d: &[f32], _i: &cpal::InputCallbackInfo| {}, |e| eprintln!("probe: {e}"), None) {
+                Ok(s) => {
+                    drop(s);
+                    input_block = Some((bs, is_fixed));
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let (input_bs, input_fixed) = input_block.unwrap_or((0, false));
+        if input_block.is_none() {
+            if let Some(e) = last_err {
+                println!("⚠ Fixed buffers rechazados ({e}) — usando Default");
+            }
+        }
         let config = StreamConfig {
             channels: self.channels as u16,
-            sample_rate: default_cfg.sample_rate(),
-            buffer_size: BufferSize::Default,
+            sample_rate: SampleRate(sample_rate),
+            buffer_size: if input_fixed { BufferSize::Fixed(input_bs) } else { BufferSize::Default },
         };
+        // target del colchón: ~2.2 bloques de entrada, mínimo 30ms
+        let input_block_ms = if input_fixed {
+            input_bs as f32 * 1000.0 / sample_rate as f32
+        } else {
+            85.0 // Default típico de CoreAudio (~4096 frames @48k)
+        };
+        let target_ms = (input_block_ms * 2.2).max(30.0);
+
         let ring = self.ring.clone();
         let total = self.total_captured.clone();
         let playback_slot = self.playback.clone();
         let channels = self.channels;
         let capacity = self.buffer_size_samples;
-        let stream = device
-            .build_input_stream(
-                &config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let frames = data.len() / channels;
-                    write_ring(&mut ring.lock().unwrap(), data, channels, capacity);
-                    total.fetch_add(frames as u64, Ordering::Relaxed);
-                    if let Some(p) = playback_slot.lock().unwrap().as_ref() {
-                        p.add_audio_data(data.to_vec());
-                    }
-                },
-                |err| eprintln!("Audio callback status: {err}"),
-                None,
-            )
-            .context("failed to build audio input stream")?;
+        let last_input_ms = Arc::new(AtomicU64::new(0));
+        let last_input_ms_wd = last_input_ms.clone();
+
+        // Constructor extraído: el watchdog reconstruye la entrada con los
+        // MISMOS Arcs. `move`, dueño de sus capturas; vive en main thread
+        // (cpal Device no es Send).
+        let device_for_builder = device.clone();
+        let config_for_builder = config.clone();
+        let make_input: Box<dyn Fn() -> Result<Stream>> = Box::new(move || {
+            let ring = ring.clone();
+            let total = total.clone();
+            let playback_slot = playback_slot.clone();
+            let last_input_ms = last_input_ms.clone();
+            let config = config_for_builder.clone();
+            device_for_builder
+                .build_input_stream(
+                    &config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        last_input_ms.store(now_ms(), Ordering::Relaxed);
+                        let frames = data.len() / channels;
+                        write_ring(&mut ring.lock().unwrap(), data, channels, capacity);
+                        total.fetch_add(frames as u64, Ordering::Relaxed);
+                        if let Some(p) = playback_slot.lock().unwrap().as_ref() {
+                            p.add_audio_data(data.to_vec());
+                        }
+                    },
+                    |err| eprintln!("Audio callback status: {err}"),
+                    None,
+                )
+                .context("failed to build audio input stream")
+        });
+
+        let stream = make_input()?;
         stream.play().context("failed to start audio input stream")?;
         *self.start_time.lock().unwrap() = Some(Instant::now());
-        let mode = if self.low_latency_mode { "low-latency" } else { "normal" };
+        let input_desc = if input_fixed {
+            format!("Fixed({input_bs}) ~{input_block_ms:.1}ms")
+        } else {
+            "Default (CoreAudio)".to_string()
+        };
         println!(
-            "Audio capture started ({mode}): {sample_rate}Hz, {} channels",
+            "Audio capture started: {sample_rate}Hz, {} channels, bloque de entrada: {input_desc}",
             self.channels
         );
 
@@ -362,11 +479,13 @@ impl AudioCapture {
             let playback = Arc::new(AudioPlayback::new(self.channels, self.low_latency_mode));
             let volume = *self.volume.lock().unwrap();
             playback.set_volume(volume);
-            match playback.start(sample_rate, self.block_size) {
+            // bloque de salida pequeño también: aporta un bloque de latencia
+            let out_bs = self.block_size.min(512);
+            match playback.start(sample_rate, out_bs, target_ms) {
                 Ok(out_stream) => {
                     *self.playback.lock().unwrap() = Some(playback);
                     playback_output = Some(out_stream);
-                    println!("✓ Audio playback/monitoring enabled");
+                    println!("✓ Audio playback/monitoring enabled (target ~{target_ms:.0}ms)");
                 }
                 Err(e) => {
                     println!("⚠ Could not start audio playback: {e:#}");
@@ -375,9 +494,56 @@ impl AudioCapture {
             }
         }
 
+        // Watchdog (parche de negociación): solo atómicos cruzan threads;
+        // el renderer atiende la bandera via poll_rebuild().
+        let mut rebuild_flag = None;
+        let mut wd_stop = None;
+        let mut wd_handle = None;
+        let input_holder: Arc<Mutex<Option<Stream>>> = Arc::new(Mutex::new(Some(stream)));
+        {
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_c = stop_flag.clone();
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag_c = flag.clone();
+            let last_wd = last_input_ms_wd.clone();
+            let stall_ms: u64 = 2000;
+            let handle = std::thread::Builder::new()
+                .name("av-audio-watchdog".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        if stop_c.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let last = last_wd.load(Ordering::Relaxed);
+                        if last == 0 {
+                            continue;
+                        }
+                        let now = now_ms();
+                        if now.saturating_sub(last) > stall_ms
+                            && !flag_c.swap(true, Ordering::Relaxed)
+                        {
+                            println!("[watchdog] entrada de audio estancada {}ms — pidiendo rebuild", now - last);
+                        }
+                    }
+                })
+                .ok();
+            if handle.is_some() {
+                wd_handle = handle;
+                wd_stop = Some(stop_flag);
+                rebuild_flag = Some(flag);
+                println!("✓ Watchdog de audio activo (stall > {stall_ms}ms → rebuild)");
+            }
+        }
+
         Ok(AudioStreams {
-            input: Some(stream),
+            input: input_holder,
             playback_output,
+            rebuild_flag,
+            rebuild_next_ms: Arc::new(AtomicU64::new(0)),
+            rebuild_fn: Some(make_input),
+            wd_stop,
+            wd_handle,
         })
     }
 
