@@ -85,6 +85,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// HH:MM:SS de reloj de pared LOCAL — para correlacionar los eventos de
+/// audio con logs externos (formatguard, consola).
+fn wall_clock() -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::from("??:??:??");
+        }
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
 impl AudioStreams {
     pub fn stop(&mut self) {
         if let Some(f) = self.wd_stop.take() {
@@ -261,8 +274,9 @@ impl AudioPlayback {
                                 s as f64 * 1000.0 / (sample_rate as f64 * channels as f64)
                             };
                             println!(
-                                "[audio t={:.0}s] cola: min={:.1}ms avg={:.1}ms max={:.1}ms (target {:.0}ms)",
+                                "[audio t={:.0}s @{}] cola: min={:.1}ms avg={:.1}ms max={:.1}ms (target {:.0}ms)",
                                 dg.t(),
+                                wall_clock(),
                                 ms(dg.min_q),
                                 ms(avg as usize),
                                 ms(dg.max_q),
@@ -343,8 +357,9 @@ impl AudioPlayback {
                     }
                     if silent_frames > 0 && dg.last_underrun_log.elapsed().as_secs() >= 1 {
                         println!(
-                            "[audio t={:.0}s] UNDERRUN: {silent_frames} frames silenciados ({:.1}ms), cola al inicio={queued} samples",
+                            "[audio t={:.0}s @{}] UNDERRUN: {silent_frames} frames silenciados ({:.1}ms), cola al inicio={queued} samples",
                             dg.t(),
+                            wall_clock(),
                             silent_frames as f64 * 1000.0 / sample_rate as f64
                         );
                         dg.last_underrun_log = Instant::now();
@@ -570,8 +585,9 @@ impl AudioCapture {
                         if prev != 0 && now.saturating_sub(prev) > 15 {
                             let gap_ms = now - prev;
                             println!(
-                                "[audio t={:.0}s] INPUT GAP: {gap_ms}ms desde el callback anterior",
-                                t0_input.elapsed().as_secs_f64()
+                                "[audio t={:.0}s @{}] INPUT GAP: {gap_ms}ms desde el callback anterior",
+                                t0_input.elapsed().as_secs_f64(),
+                                wall_clock()
                             );
                             // Colchón adaptativo: el gap observado define el
                             // colchón necesario (gap + 50ms de margen, tope
@@ -581,16 +597,18 @@ impl AudioCapture {
                             if needed > cur {
                                 cushion_gap.store(needed, Ordering::Relaxed);
                                 println!(
-                                    "[audio t={:.0}s] colchón adaptativo: {cur}ms → {needed}ms (gap {gap_ms}ms)",
-                                    t0_input.elapsed().as_secs_f64()
+                                    "[audio t={:.0}s @{}] colchón adaptativo: {cur}ms → {needed}ms (gap {gap_ms}ms)",
+                                    t0_input.elapsed().as_secs_f64(),
+                                    wall_clock()
                                 );
                             }
                         }
                         let prev_len = last_block_len.swap(data.len(), Ordering::Relaxed);
                         if prev_len != 0 && prev_len != data.len() {
                             println!(
-                                "[audio t={:.0}s] bloque de entrada cambió: {prev_len} -> {} samples (¿renegociación?)",
+                                "[audio t={:.0}s @{}] bloque de entrada cambió: {prev_len} -> {} samples (¿renegociación?)",
                                 t0_input.elapsed().as_secs_f64(),
+                                wall_clock(),
                                 data.len()
                             );
                         }

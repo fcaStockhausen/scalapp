@@ -3348,6 +3348,7 @@ dependencies = [
  "cpal",
  "ctrlc",
  "eframe",
+ "libc",
  "nokhwa",
  "serde_json",
 ]
