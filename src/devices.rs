@@ -7,6 +7,28 @@ use nokhwa::utils::{
 };
 use nokhwa::{query, Camera};
 
+/// Abre una cámara tragando las NSException del binding (que llegan como
+/// panic). El binding macOS de nokhwa puede lanzar en set_all cuando el
+/// modo pedido no calza con la lista del device (visto: MS2131 en USB2,
+/// donde no existe YUYV 1080p60) — eso debe ser un intento fallido, no
+/// un crash de la app.
+pub fn try_camera_new(
+    index: CameraIndex,
+    requested: RequestedFormat,
+) -> Result<Camera, String> {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Camera::new(index, requested)
+    }));
+    std::panic::set_hook(prev_hook);
+    match result {
+        Ok(Ok(camera)) => Ok(camera),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("excepción NSException del binding al setear el formato".into()),
+    }
+}
+
 #[derive(Clone)]
 pub struct AudioDevInfo {
     pub id: usize,
@@ -117,27 +139,34 @@ pub fn auto_detect_audio() -> Vec<AudioDevInfo> {
     candidates
 }
 
-/// Sondea un dispositivo por uniqueID (identidad estable). Pide primero el
-/// modo de monitoreo exacto (1080p60): si el dispositivo lo soporta, es el
-/// modo que usará la captura y el probe no deja negociado otro formato
-/// (salud de la MS2131).
 pub fn probe_camera_by_id(unique_id: &str) -> Option<(u32, u32, f32, String)> {
-    let index = CameraIndex::String(unique_id.to_string());
-    let exact = CameraFormat::new_from(1920, 1080, FrameFormat::YUYV, 60);
-    if let Ok(camera) = Camera::new(
-        index.clone(),
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact)),
+    // Mejor modo REAL del device (1080p60 exacto si existe; si no — USB2 —
+    // el más cercano). Pedir solo modos que existen: el set_all de nokhwa
+    // lanza NSException con modos fantasma y deja el device lockeado.
+    let mode = match best_mode_for_device(unique_id, (1920, 1080, 60)) {
+        Some(m) => m,
+        None => {
+            eprintln!("[probe] {unique_id}: sin modos YUYV/MJPEG en la lista");
+            return None;
+        }
+    };
+    eprintln!(
+        "[probe] {unique_id}: mejor modo {}x{}@{} {:?}",
+        mode.resolution().width_x,
+        mode.resolution().height_y,
+        mode.frame_rate(),
+        mode.format()
+    );
+    let camera = match try_camera_new(
+        CameraIndex::String(unique_id.to_string()),
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(mode)),
     ) {
-        let resolution = camera.resolution();
-        return Some((
-            resolution.width_x,
-            resolution.height_y,
-            camera.frame_rate() as f32,
-            camera.info().human_name().to_string(),
-        ));
-    }
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
-    let camera = Camera::new(index, requested).ok()?;
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[probe] {unique_id}: open falló: {e}");
+            return None;
+        }
+    };
     let resolution = camera.resolution();
     Some((
         resolution.width_x,
@@ -147,33 +176,19 @@ pub fn probe_camera_by_id(unique_id: &str) -> Option<(u32, u32, f32, String)> {
     ))
 }
 
+#[allow(dead_code)]
 pub fn probe_camera(index: u32) -> Option<(u32, u32, f32)> {
     probe_camera_by_index(index).map(|(w, h, fps, _)| (w, h, fps))
 }
 
 fn probe_camera_by_index(index: u32) -> Option<(u32, u32, f32, String)> {
-    let exact = CameraFormat::new_from(1920, 1080, FrameFormat::YUYV, 60);
-    if let Ok(camera) = Camera::new(
-        CameraIndex::Index(index),
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact)),
-    ) {
-        let resolution = camera.resolution();
-        return Some((
-            resolution.width_x,
-            resolution.height_y,
-            camera.frame_rate() as f32,
-            camera.info().human_name().to_string(),
-        ));
-    }
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
-    let camera = Camera::new(CameraIndex::Index(index), requested).ok()?;
-    let resolution = camera.resolution();
-    Some((
-        resolution.width_x,
-        resolution.height_y,
-        camera.frame_rate() as f32,
-        camera.info().human_name().to_string(),
-    ))
+    // resolver índice → uniqueID por la enumeración de AVFoundation
+    let uid = nokhwa_bindings_macos::query_avfoundation()
+        .ok()?
+        .into_iter()
+        .nth(index as usize)
+        .map(|info| info.misc().to_string())?;
+    probe_camera_by_id(&uid)
 }
 
 fn system_profiler_camera_names() -> Vec<String> {
@@ -217,6 +232,58 @@ fn query_devices_full() -> Vec<(u32, String, String)> {
         .collect()
 }
 
+/// Elige el mejor modo SEGURO del device (por uniqueID) para el request
+/// `want` (w, h, fps). Lee la lista por AVFoundation — sin HID (no toca
+/// el isoch).
+///
+/// Regla de seguridad (bug del binding nokhwa, 29/10): su set_all deja
+/// como formato activo la ÚLTIMA entrada con las dimensiones pedidas
+/// pero el rango de fps puede venir de un duplicado anterior → par
+/// inconsistente → NSException (visto: MS2131 en USB2, donde 1080p@50
+/// está en la lista pero explota). Pedir exactamente una entrada que
+/// sea la última de sus dimensiones es seguro por construcción.
+///
+/// Scoring si no hay exacto: fps más cercano primero, luego área
+/// (monitoreo: fluidez > tamaño).
+pub fn best_mode_for_device(uid: &str, want: (u32, u32, u32)) -> Option<CameraFormat> {
+    let device =
+        nokhwa_bindings_macos::AVCaptureDevice::new(&CameraIndex::String(uid.to_string())).ok()?;
+    let entries: Vec<CameraFormat> = device
+        .supported_formats()
+        .ok()?
+        .into_iter()
+        .filter(|f| matches!(f.format(), FrameFormat::YUYV | FrameFormat::MJPEG))
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    // última entrada por dimensiones (orden de lista preservado)
+    let mut last_by_dims: Vec<CameraFormat> = Vec::new();
+    for f in &entries {
+        match last_by_dims
+            .iter_mut()
+            .find(|e| e.resolution() == f.resolution())
+        {
+            Some(slot) => *slot = *f,
+            None => last_by_dims.push(*f),
+        }
+    }
+    if let Some(exact) = last_by_dims.iter().find(|f| {
+        f.resolution().width_x == want.0
+            && f.resolution().height_y == want.1
+            && f.frame_rate() == want.2
+    }) {
+        return Some(*exact);
+    }
+    let want_area = (want.0 as i64) * (want.1 as i64);
+    last_by_dims.sort_by_key(|f| {
+        let area = (f.resolution().width_x as i64) * (f.resolution().height_y as i64);
+        let fps_diff = (f.frame_rate() as i64 - want.2 as i64).abs();
+        (fps_diff, (area - want_area).abs())
+    });
+    last_by_dims.first().copied()
+}
+
 fn is_capture_device_name(name_lower: &str) -> bool {
     ["hdmi", "capture", "usb", "elgato", "magewell", "blackmagic",
         "avermedia", "hdmic", "video", "usb-video", "composite", "component"]
@@ -245,7 +312,9 @@ pub fn auto_detect_video() -> Vec<VideoCandidate> {
                 continue;
             }
             if let Some((w, h, fps, _dev_name)) = probe_camera_by_id(&unique_id) {
-                if w >= 1280 && h >= 720 {
+                // la identidad ya la dio el nombre; aceptar el mejor modo
+                // que el device entregue (en USB2 no hay ≥720p usable)
+                if w > 0 && h > 0 {
                     let device_name = format!("{name} {w}x{h}@{fps:.0}fps");
                     println!("  -> Encontrado: {device_name} (ID: {index})");
                     candidates.push(VideoCandidate {
@@ -298,7 +367,12 @@ pub fn auto_detect_video() -> Vec<VideoCandidate> {
         println!("Buscando por capacidades (dispositivos con resolución HDMI)...");
         for i in 0..5u32 {
             if let Some((w, h, fps, dev_name)) = probe_camera_by_index(i) {
-                if w >= 1280 && h >= 720 && !(w == 1280 && h == 720 && fps < 31.0) {
+                let dev_lower = dev_name.to_lowercase();
+                if w >= 1280
+                    && h >= 720
+                    && !(w == 1280 && h == 720 && fps < 31.0)
+                    && !is_excluded_device_name(&dev_lower)
+                {
                     let device_name = format!("Capturadora_Generica_{i} {w}x{h}@{fps:.0}fps");
                     println!("  -> Encontrado: {device_name} (ID: {i})");
                     candidates.push(VideoCandidate {

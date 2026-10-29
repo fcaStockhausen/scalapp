@@ -10,6 +10,12 @@ cpal = "0.15"
 eframe = "0.29"
 libc = "0.2"
 nokhwa = { version = "0.10", features = ["input-native"] }
+# binding directo (misma instancia que usa nokhwa 0.10.11): leer la lista
+# REAL de modos del device ANTES de pedir uno — nokhwa's set_all lanza
+# NSException si el modo no existe (MS2131 en USB2) y deja el device
+# lockeado dentro del proceso.
+nokhwa-bindings-macos = "=0.2.4"
+nokhwa-core = "=0.1.9"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 ctrlc = "3"

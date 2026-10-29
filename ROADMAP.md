@@ -72,6 +72,18 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   dispositivo en "Lock Rejected" para todos los demás (nokhwa no libera
   limpio en todos los paths). Síntoma: `set_all` falla con
   `lockForConfiguration`. Matar el proceso libera.
+- **Bug del binding nokhwa en modos duplicados (29/10, USB2)**: el
+  `set_all` deja como formato activo la ÚLTIMA entrada con las
+  dimensiones pedidas, pero el rango de fps puede venir de un
+  duplicado anterior → par inconsistente → NSException que mata el
+  proceso. En USB2 la MS2131 lista los modos con duplicados
+  asimétricos (uno completo, uno limitado), así que 1080p@50/30/20
+  "existen" en la lista pero explotan al pedirlos. **Regla segura:
+  pedir solo entradas que sean la última de sus dimensiones** —
+  verificado 11/11 en USB2. scalapp ahora pre-valida la lista real
+  por AVFoundation (binding directo, sin HID) y elige modo seguro;
+  además todos los opens van bajo catch_unwind. En USB2 el mejor modo
+  seguro es 800x600@60 (o 1080p@10 con --video-fps 10).
 
 ### Fase 2 — Push en vez de poll
 - [ ] Reemplazar nokhwa por **AVFoundation con delegate**

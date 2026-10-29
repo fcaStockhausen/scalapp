@@ -2,7 +2,10 @@ use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
     CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
 };
-use nokhwa::Camera;use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use nokhwa::Camera;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use crate::devices;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -146,18 +149,65 @@ impl VideoCapture {
         }
     }
 
-    /// Pide el formato EXACTO al dispositivo (no AbsoluteHighestResolution,
-    /// que negociaba 2560x1440@30 solo). Nota de terreno: la MS2131 expone
-    /// 1920x1080@60 como YUYV — macOS no lista sus modos MJPEG, así que el
-    /// fourcc del pedido es YUYV (set_all de todas formas casa solo por
-    /// resolución+fps). Con uniqueID la identidad es determinista; el
-    /// escaneo solo aplica a Index(n) (orden inestable entre sesiones).
-    /// Último recurso: Closest.
-    fn open_camera(&self) -> Result<Camera, nokhwa::NokhwaError> {
+    /// Abre la cámara pidiendo un modo que EXISTE en el device.
+    ///
+    /// 1. Pre-validación por AVFoundation (sin HID): leer la lista real de
+    ///    modos por uniqueID y elegir el mejor (exacto si hay; si no —
+    ///    USB2 — el más cercano). Pedir solo modos reales evita el bug del
+    ///    binding: set_all lanza NSException con modos fantasma y deja el
+    ///    device lockeado dentro del proceso.
+    /// 2. Cadena legacy blindada (Index explícito o sin lista):
+    ///    Exact → escaneo → Closest YUYV → Closest MJPEG, todo bajo
+    ///    catch_unwind.
+    fn open_camera(&self) -> Result<Camera, String> {
+        let uid: Option<String> = match &self.device {
+            CameraIndex::String(s) => Some(s.clone()),
+            CameraIndex::Index(i) => nokhwa_bindings_macos::query_avfoundation()
+                .ok()
+                .and_then(|v| v.into_iter().nth(*i as usize))
+                .map(|info| info.misc().to_string()),
+        };
+        if let Some(uid) = uid {
+            if let Some(mode) =
+                devices::best_mode_for_device(&uid, (self.width, self.height, self.fps))
+            {
+                if mode.resolution().width_x == self.width
+                    && mode.resolution().height_y == self.height
+                    && mode.frame_rate() == self.fps
+                {
+                    println!(
+                        "Pre-validated exact {}x{}@{} {:?}",
+                        self.width,
+                        self.height,
+                        self.fps,
+                        mode.format()
+                    );
+                } else {
+                    println!(
+                        "⚠ exact {}x{}@{} unavailable — best real mode: {}x{}@{} {:?}",
+                        self.width,
+                        self.height,
+                        self.fps,
+                        mode.resolution().width_x,
+                        mode.resolution().height_y,
+                        mode.frame_rate(),
+                        mode.format()
+                    );
+                }
+                if let Ok(camera) = devices::try_camera_new(
+                    self.device.clone(),
+                    RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(mode)),
+                ) {
+                    return Ok(camera);
+                }
+                println!("pre-validated open failed — falling back to nokhwa negotiation");
+            }
+        }
+
         let wanted = CameraFormat::new_from(self.width, self.height, FrameFormat::YUYV, self.fps);
         let exact = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(wanted));
 
-        match Camera::new(self.device.clone(), exact) {
+        match devices::try_camera_new(self.device.clone(), exact) {
             Ok(camera) => return Ok(camera),
             Err(e) => println!(
                 "Exact format {}x{}@{} YUYV rejected on {:?}: {e}",
@@ -171,7 +221,7 @@ impl VideoCapture {
                     if idx == primary {
                         continue;
                     }
-                    match Camera::new(CameraIndex::Index(idx), exact) {
+                    match devices::try_camera_new(CameraIndex::Index(idx), exact) {
                         Ok(camera) => {
                             println!("Exact format negotiated at alternate index {idx}");
                             return Ok(camera);
@@ -184,10 +234,20 @@ impl VideoCapture {
         }
 
         println!("Falling back to closest match on {:?}", self.device);
-        Camera::new(
+        if let Ok(camera) = devices::try_camera_new(
             self.device.clone(),
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(wanted)),
+        ) {
+            return Ok(camera);
+        }
+
+        println!("No YUYV mode available — trying closest MJPEG");
+        let mjpeg = CameraFormat::new_from(self.width, self.height, FrameFormat::MJPEG, self.fps);
+        devices::try_camera_new(
+            self.device.clone(),
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(mjpeg)),
         )
+        .map_err(|e| format!("cannot open camera device {:?}: {e}", self.device))
     }
 
     fn capture_loop(&self, tx: std::sync::mpsc::Sender<Result<(u32, u32, f32), String>>) {

@@ -3350,6 +3350,8 @@ dependencies = [
  "eframe",
  "libc",
  "nokhwa",
+ "nokhwa-bindings-macos",
+ "nokhwa-core",
  "serde_json",
 ]
 
