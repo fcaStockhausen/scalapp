@@ -113,8 +113,10 @@ struct PassthroughV4 {
     /// reconstruye el stream de entrada (revive tras la muerte por
     /// doble cliente). 0 = watchdog desactivado.
     stall_ms: u64,
-    /// Notch del hum del chip (--notch-hum): 59.94/120/180 Hz.
+    /// Notch del hum del chip (--notch-hum): 60/120/180 Hz + HP opcional
+    /// (--hpf) para el rumor 28-38 Hz.
     notch_hum: bool,
+    hpf_hz: u32,
     buffer: Arc<Mutex<VecDeque<Vec<f32>>>>,
     virtual_buffer: Arc<Mutex<VecDeque<Vec<f32>>>>,
     volume: Arc<AtomicF32>,
@@ -132,6 +134,7 @@ impl PassthroughV4 {
             delay_ms: 0,
             stall_ms: 0,
             notch_hum: false,
+            hpf_hz: 0,
             buffer: Arc::new(Mutex::new(VecDeque::new())),
             virtual_buffer: Arc::new(Mutex::new(VecDeque::new())),
             volume: Arc::new(AtomicF32::new(volume)),
@@ -152,6 +155,11 @@ impl PassthroughV4 {
 
     fn with_notch_hum(mut self, on: bool) -> Self {
         self.notch_hum = on;
+        self
+    }
+
+    fn with_hpf(mut self, hz: u32) -> Self {
+        self.hpf_hz = hz;
         self
     }
 
@@ -332,12 +340,23 @@ impl PassthroughV4 {
         let drift_out = drift.clone();
         // Notch del hum (--notch-hum): el refresco vertical del chip se
         // acopla al audio cuando streamea video (60/120/180 Hz).
-        let notch_out = self
-            .notch_hum
-            .then(|| Arc::new(Mutex::new(crate::audio::NotchBank::hum_filter(sample_rate))));
+        let notch_out = (self.notch_hum || self.hpf_hz > 0).then(|| {
+            let mut bank = if self.notch_hum {
+                crate::audio::NotchBank::hum_notches(sample_rate)
+            } else {
+                crate::audio::NotchBank::new(sample_rate, &[], 1.0)
+            };
+            if self.hpf_hz > 0 {
+                bank = bank.with_highpass(self.hpf_hz as f32);
+            }
+            Arc::new(Mutex::new(bank))
+        });
         let notch_cb = notch_out.clone();
         if self.notch_hum {
-            println!("  Filtro anti-hum: HP 48Hz x2 + notch 60.06/120.12/180.18 Hz");
+            println!("  Notch anti-hum: 60.06/120.12/180.18 Hz (Q=25)");
+        }
+        if self.hpf_hz > 0 {
+            println!("  High-pass: {}Hz (atenúa el sub-bajo del contenido)", self.hpf_hz);
         }
         let output_stream = output
             .build_output_stream(
@@ -596,6 +615,11 @@ impl PassthroughWithVolume {
 
     pub fn with_notch_hum(mut self, on: bool) -> Self {
         self.passthrough = self.passthrough.with_notch_hum(on);
+        self
+    }
+
+    pub fn with_hpf(mut self, hz: u32) -> Self {
+        self.passthrough = self.passthrough.with_hpf(hz);
         self
     }
 

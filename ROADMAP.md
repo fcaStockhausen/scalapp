@@ -116,8 +116,10 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   subarmónico ~30 Hz + rumor 28-38 Hz, +7 dB sobre el nivel audio-only.
   NO es hum de red (Chile = 50 Hz). Nace dentro del chip (la captura
   es digital de punta a punta). Mitigación software: `--notch-hum`
-  (HP 48 Hz ×2 + notches 60.06/120.12/180.18, Q=12) → RMS de salida
-  −15 dB, tono y rumor fuera del espectro. Los Hz exactos pueden
+  (notches 60.06/120.12/180.18 a Q=25 — quirúrgico, B1/B2 a -1.9dB) +
+  `--hpf <hz>` opcional para el rumor 28-38Hz (cuesta sub-bajo del
+  contenido: E1 -9dB/A1 -4dB con 48Hz). Validado grabando la salida:
+  tono fuera del espectro. Los Hz exactos pueden
   variar con la fuente: si cambia el refresh (50 Hz PAL etc.), hay que
   re-medir (SCALAPP_REC + SCALAPP_REC_OUT para captura/salida cruda).
 - **La MS2131 dropea audio isócrono mientras streamea video** (30/10):

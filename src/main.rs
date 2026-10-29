@@ -191,9 +191,16 @@ struct Args {
 
     /// Notch del hum del chip: con video streameando, la MS2131 acopla su
     /// refresco vertical al audio (tono puro ~60 Hz + armónicos 120/180,
-    /// medido +7dB). Filtra 59.94/119.88/179.82 Hz con Q alto.
+    /// medido +7dB). Filtra 60.06/120.12/180.18 Hz con Q=25 (quirúrgico:
+    /// B1/B2 quedan a -1.8dB, el contenido del juego sobrevive).
     #[arg(long = "notch-hum", default_value_t = false)]
     notch_hum: bool,
+
+    /// High-pass opcional en Hz (default off): mata el rumor 28-38 Hz del
+    /// chip PERO también colorea el bajo del contenido (HP 48: E1/41Hz
+    /// −9dB, A1/55Hz −4dB, B1/62Hz −3dB) — decisión del usuario.
+    #[arg(long = "hpf", default_value_t = 0)]
+    hpf: u32,
 
     #[arg(long)]
     ultra_low_latency: bool,
@@ -275,7 +282,7 @@ fn run(args: Args) -> Result<()> {
 
     if direct_passthrough {
         run_direct_passthrough(audio_device_index, args.block_size, args.virtual_out.clone(),
-                               args.delay_ms, args.stall_ms, args.notch_hum)?;
+                               args.delay_ms, args.stall_ms, args.notch_hum, args.hpf)?;
         return Ok(());
     }
 
@@ -311,6 +318,7 @@ fn run(args: Args) -> Result<()> {
         println!("✓ Audio cushion base: {}ms", args.audio_cushion_ms);
     }
     audio_capture.set_notch_hum(args.notch_hum);
+    audio_capture.set_hpf(args.hpf);
     println!(
         "✓ Audio capture initialized: {}Hz, {} channels",
         args.audio_rate, 2
@@ -494,7 +502,7 @@ fn run(args: Args) -> Result<()> {
 }
 
 fn run_direct_passthrough(audio_device_index: Option<usize>, block_size_arg: Option<u32>, virtual_out: Option<String>,
-                          delay_ms: u32, stall_ms: u64, notch_hum: bool) -> Result<()> {
+                          delay_ms: u32, stall_ms: u64, notch_hum: bool, hpf: u32) -> Result<()> {
     let block_size = block_size_arg.unwrap_or(256);
     let block_ms = (block_size as f64 / 44100.0) * 1000.0;
 
@@ -513,7 +521,8 @@ fn run_direct_passthrough(audio_device_index: Option<usize>, block_size_arg: Opt
     let passthrough = PassthroughWithVolume::new(44100, 2, block_size, 0.3)
         .with_cushion(delay_ms, stall_ms)
         .with_virtual_out(virtual_out)
-        .with_notch_hum(notch_hum);
+        .with_notch_hum(notch_hum)
+        .with_hpf(hpf);
     let mut streams = passthrough.start(audio_device_index)?;
     println!("✓ Direct passthrough V4 started\n");
 

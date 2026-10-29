@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleRate, Stream, StreamConfig};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -64,7 +64,6 @@ fn write_ring(ring: &mut Ring, data: &[f32], channels: usize, capacity_frames: u
     ring.write = end % capacity_frames;
 }
 
-/// Notch biquad (RBJ cookbook), forma directa II transpuesta.
 struct NotchCoeffs {
     b0: f32,
     b1: f32,
@@ -110,20 +109,29 @@ impl NotchBank {
         }
     }
 
-    /// Cadena completa anti-hum: HP 48 Hz ×2 (4º orden: el rumor del chip
-    /// vive en 28-38 Hz y un solo biquad lo baja poco) + notches
-    /// 60.06/120.12/180.18 (frecuencias medidas del acople; Q=12 tolera
-    /// deriva del cristal).
-    pub fn hum_filter(sample_rate: u32) -> Self {
-        let mut bank = Self::new(sample_rate, &[60.06, 120.12, 180.18], 12.0);
-        bank.push_highpass(48.0);
-        bank.push_highpass(48.0);
-        bank
+    /// Notches quirúrgicos del hum: 60.06/120.12/180.18 Hz (medidos con
+    /// resolución 0.09Hz — el tono es crystal-estable) a Q=25: banda -3dB
+    /// de ±1.2Hz en 60 → B1 (61.7Hz) queda a -1.8dB, B2 (123.5Hz) a
+    /// -1.8dB — el contenido del juego sobrevive. (Q=12 costaba -5dB en
+    /// esos tonos: mala compra contra deriva que no existe.)
+    pub fn hum_notches(sample_rate: u32) -> Self {
+        Self::new(sample_rate, &[60.06, 120.12, 180.18], 25.0)
+    }
+
+    /// Agrega un high-pass 4º orden (2 biquads cascados). Opt-in via
+    /// --hpf: mata el rumor 28-38Hz del chip PERO también el sub-bajo
+    /// del contenido (a 41Hz/E1 ≈ -10dB con hpf=48) — decisión del
+    /// usuario según qué esté monitoreando.
+    pub fn with_highpass(mut self, f0: f32) -> Self {
+        self.push_highpass(f0);
+        self.push_highpass(f0);
+        self
     }
 
     fn push_highpass(&mut self, f0: f32) {
         let w0 = 2.0 * std::f32::consts::PI * f0 / self.fs;
-        let alpha = w0.sin() / (2.0f32 * std::f32::consts::SQRT_2);
+        // Butterworth: Q = 1/sqrt(2) → alpha = sin(w0)/(2Q) = sin(w0)/sqrt(2)
+        let alpha = w0.sin() / std::f32::consts::SQRT_2;
         let a0 = 1.0 + alpha;
         let cosw = w0.cos();
         self.coeffs.push(NotchCoeffs {
@@ -272,6 +280,7 @@ impl AudioPlayback {
         block_size: u32,
         cushion_ms: Arc<AtomicU64>,
         notch_hum: bool,
+        hpf_hz: u32,
     ) -> Result<Stream> {
         // tope de seguridad por tiempo (~0.75s) — con deriva compensada
         // la cola vive cerca del objetivo, no del tope
@@ -339,10 +348,19 @@ impl AudioPlayback {
         let drift_out = drift.clone();
         let diag_out = diag.clone();
         let cushion_out = cushion_ms.clone();
-        // Notch del hum (59.94/119.88/179.82 — el refresco vertical del
-        // chip acoplado al audio con video activo) + grabador de SALIDA
-        // para validación (SCALAPP_REC_OUT, post-notch).
-        let notch_out = notch_hum.then(|| Arc::new(Mutex::new(NotchBank::hum_filter(sample_rate))));
+        // Filtro anti-hum (opt-in) + grabador de SALIDA para validación
+        // (SCALAPP_REC_OUT, post-filtro).
+        let notch_out = (notch_hum || hpf_hz > 0).then(|| {
+            let mut bank = if notch_hum {
+                NotchBank::hum_notches(sample_rate)
+            } else {
+                NotchBank::new(sample_rate, &[], 1.0)
+            };
+            if hpf_hz > 0 {
+                bank = bank.with_highpass(hpf_hz as f32);
+            }
+            Arc::new(Mutex::new(bank))
+        });
         let notch_cb = notch_out.clone();
         let rec_out_file = std::env::var("SCALAPP_REC_OUT").ok().map(|path| {
             let f = std::fs::OpenOptions::new()
@@ -360,7 +378,10 @@ impl AudioPlayback {
             device.name().unwrap_or_else(|_| "?".into())
         );
         if notch_hum {
-            println!("✓ Filtro anti-hum activo: HP 48Hz x2 + notch 60.06/120.12/180.18 Hz");
+            println!("✓ Notch anti-hum activo: 60.06/120.12/180.18 Hz (Q=25, quirúrgico)");
+        }
+        if hpf_hz > 0 {
+            println!("✓ High-pass {hpf_hz}Hz activo (ojo: atenúa el sub-bajo del contenido)");
         }
         let stream = device
             .build_output_stream(
@@ -569,6 +590,9 @@ pub struct AudioCapture {
     cushion_base_ms: AtomicU64,
     /// Notch del hum del chip (59.94/120/180 Hz con video activo).
     notch_hum: std::sync::atomic::AtomicBool,
+    /// High-pass opcional en Hz (0 = off). Mata el rumor 28-38Hz del
+    /// chip, también el sub-bajo del contenido — decisión del usuario.
+    hpf_hz: AtomicU32,
 }
 
 impl AudioCapture {
@@ -601,6 +625,7 @@ impl AudioCapture {
             volume: Mutex::new(0.5),
             cushion_base_ms: AtomicU64::new(0),
             notch_hum: std::sync::atomic::AtomicBool::new(false),
+            hpf_hz: AtomicU32::new(0),
         }
     }
 
@@ -612,6 +637,11 @@ impl AudioCapture {
     /// Activa el notch del hum (--notch-hum).
     pub fn set_notch_hum(&self, on: bool) {
         self.notch_hum.store(on, Ordering::Relaxed);
+    }
+
+    /// High-pass opcional (--hpf, 0 = off).
+    pub fn set_hpf(&self, hz: u32) {
+        self.hpf_hz.store(hz, Ordering::Relaxed);
     }
 
     pub fn start(&self) -> Result<AudioStreams> {
@@ -805,6 +835,7 @@ impl AudioCapture {
                 out_bs,
                 cushion_ms.clone(),
                 self.notch_hum.load(Ordering::Relaxed),
+                self.hpf_hz.load(Ordering::Relaxed),
             ) {
                 Ok(out_stream) => {
                     *self.playback.lock().unwrap() = Some(playback);
@@ -990,30 +1021,73 @@ mod tests {
     }
 
     #[test]
-    fn notch_kills_refresh_tone_and_passes_the_rest() {
-        // el hum medido: tono a ~60 Hz con armónicos + rumor ~30 Hz
+    fn notch_is_surgical_for_game_audio() {
+        // el hum medido: tono a 60.06 Hz con armónicos. El notch debe
+        // matarlos SIN tocar notas reales del contenido.
         let fs = 48000u32;
-        let mut bank = NotchBank::hum_filter(fs);
+        let mut bank = NotchBank::hum_notches(fs);
         let n = fs as usize; // 1s
         let sine = |f: f32, t: usize| (2.0 * std::f32::consts::PI * f * t as f32 / fs as f32).sin();
         let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
-        // 60 Hz → debe atenuarse fuerte (>20dB)
-        let mut x: Vec<f32> = (0..n).map(|t| sine(60.0, t)).collect();
-        let rms_in = rms(&x);
-        bank.process_interleaved(&mut x);
-        let attn_db = 20.0 * (rms_in / rms(&x[n / 2..]).max(1e-12)).log10();
-        assert!(attn_db > 20.0, "atenuación 60Hz insuficiente: {attn_db:.1} dB");
-        // 30 Hz (rumor) → el HP lo mata
-        let mut x: Vec<f32> = (0..n).map(|t| sine(30.0, t)).collect();
-        let rms_in = rms(&x);
-        bank.process_interleaved(&mut x);
-        let attn30 = 20.0 * (rms_in / rms(&x[n / 2..]).max(1e-12)).log10();
-        assert!(attn30 > 12.0, "atenuación 30Hz insuficiente: {attn30:.1} dB");
-        // 200 Hz → debe pasar casi intacto (±0.5dB)
-        let mut y: Vec<f32> = (0..n).map(|t| sine(200.0, t)).collect();
-        let rms_in = rms(&y);
-        bank.process_interleaved(&mut y);
-        let gain_db = 20.0 * (rms(&y[n / 2..]) / rms_in).log10();
-        assert!(gain_db.abs() < 0.5, "ganancia a 200Hz: {gain_db:.2} dB");
+        // buffer INTERLEAVED estéreo (canal L y R con la misma señal):
+        // process_interleaved trata pares consecutivos como (L, R)
+        let atten_db = |bank: &mut NotchBank, f: f32| {
+            let mut x: Vec<f32> = (0..n).flat_map(|t| {
+                let s = sine(f, t);
+                [s, s]
+            })
+            .collect();
+            let rin = rms(&x);
+            bank.process_interleaved(&mut x);
+            20.0 * (rin / rms(&x[x.len() / 2..]).max(1e-12)).log10()
+        };
+        // el hum muere
+        for f0 in [60.06f32, 120.12, 180.18] {
+            let a = atten_db(&mut bank, f0);
+            assert!(a > 20.0, "hum {f0}Hz: solo {a:.1}dB");
+        }
+        // ...y el contenido del juego sobrevive (<3dB)
+        for (f, nota) in [
+            (41.2, "E1 sub-bajo"),
+            (55.0, "A1"),
+            (61.7, "B1 (pegado al notch de 60)"),
+            (82.4, "E2"),
+            (123.5, "B2 (pegado al notch de 120)"),
+            (185.0, "F#3 (pegado al notch de 180)"),
+            (200.0, "200Hz"),
+            (440.0, "A4"),
+        ] {
+            let a = atten_db(&mut bank, f);
+            assert!(a < 3.0, "{nota} ({f}Hz) dañado: {a:.1}dB");
+        }
+    }
+
+    #[test]
+    fn optional_hpf_kills_rumble_not_content_above_it() {
+        let fs = 48000u32;
+        let mut bank = NotchBank::hum_notches(fs).with_highpass(48.0);
+        let n = fs as usize;
+        let sine = |f: f32, t: usize| (2.0 * std::f32::consts::PI * f * t as f32 / fs as f32).sin();
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        let atten_db = |bank: &mut NotchBank, f: f32| {
+            let mut x: Vec<f32> = (0..n)
+                .flat_map(|t| {
+                    let s = sine(f, t);
+                    [s, s]
+                })
+                .collect();
+            let rin = rms(&x);
+            bank.process_interleaved(&mut x);
+            20.0 * (rin / rms(&x[x.len() / 2..]).max(1e-12)).log10()
+        };
+        // el rumor del chip (28-38Hz) muere
+        let a30 = atten_db(&mut bank, 30.0);
+        let a35 = atten_db(&mut bank, 35.0);
+        eprintln!("[hpf-test] 30Hz: {a30:.1}dB | 35Hz: {a35:.1}dB");
+        assert!(a30 > 12.0, "30Hz: {a30:.1}dB");
+        assert!(a35 > 10.0, "35Hz: {a35:.1}dB"); // diseño: -13.1dB
+        // el contenido sobre el HP sobrevive
+        assert!(atten_db(&mut bank, 82.4) < 3.0); // E2
+        assert!(atten_db(&mut bank, 200.0) < 1.0);
     }
 }

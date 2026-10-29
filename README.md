@@ -60,8 +60,13 @@ scalapp --video-device 1 --monitor --latency 1.0
 # con video activo; el colchón adaptativo lo cubre solo, esto fija la base)
 scalapp --video --audio-cushion-ms 150
 
-# Filtro anti-hum del chip (tono ~60Hz + rumor con video streameando)
+# Filtro anti-hum del chip (tono ~60Hz + armónicos con video streameando).
+# Quirúrgico: Q=25 toca B1/B2 a menos de -2dB, el resto del audio intacto.
 scalapp --video --notch-hum
+
+# + high-pass opcional para el rumor 28-38Hz (cuesta sub-bajo del contenido:
+# con 48Hz, E1/41Hz -9dB, A1/55Hz -4dB) — solo si el sub-bajo no importa
+scalapp --video --notch-hum --hpf 48
 
 # Utilidades
 scalapp --list-devices           # lista capturadoras HDMI detectadas
