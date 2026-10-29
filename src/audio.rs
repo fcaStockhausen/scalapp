@@ -158,7 +158,12 @@ impl AudioPlayback {
         }
     }
 
-    pub fn start(&self, sample_rate: u32, block_size: u32, target_ms: f32) -> Result<Stream> {
+    pub fn start(
+        &self,
+        sample_rate: u32,
+        block_size: u32,
+        cushion_ms: Arc<AtomicU64>,
+    ) -> Result<Stream> {
         // tope de seguridad por tiempo (~0.75s) — con deriva compensada
         // la cola vive cerca del objetivo, no del tope
         self.cap_samples.store(
@@ -185,24 +190,91 @@ impl AudioPlayback {
             block: Vec<f32>,
             primed: bool,
         }
-        let target_ms = target_ms.max(20.0);
-        let target_samples =
-            (target_ms / 1000.0 * sample_rate as f32) as usize * self.channels;
+        // Diagnóstico (30/10): blip auditivo ~1/min. Instrumentamos
+        // underruns (silencio insertado), trayectoria de la cola y el
+        // dispositivo de salida — con timestamps para casar con lo que
+        // se escucha.
+        struct Diag {
+            start: Instant,
+            min_q: usize,
+            max_q: usize,
+            sum_q: f64,
+            count: u64,
+            window: Instant,
+            last_underrun_log: Instant,
+        }
+        impl Diag {
+            fn new() -> Self {
+                Self {
+                    start: Instant::now(),
+                    min_q: usize::MAX,
+                    max_q: 0,
+                    sum_q: 0.0,
+                    count: 0,
+                    window: Instant::now(),
+                    last_underrun_log: Instant::now()
+                        - std::time::Duration::from_secs(10),
+                }
+            }
+            fn t(&self) -> f64 {
+                self.start.elapsed().as_secs_f64()
+            }
+        }
         let drift = Arc::new(Mutex::new(Drift {
             frac_pos: 0.0,
             block: Vec::new(),
             primed: false,
         }));
+        let diag = Arc::new(Mutex::new(Diag::new()));
         let buffer = self.buffer.clone();
         let drift_out = drift.clone();
+        let diag_out = diag.clone();
+        let cushion_out = cushion_ms.clone();
+        println!(
+            "Audio playback device: {}",
+            device.name().unwrap_or_else(|_| "?".into())
+        );
         let stream = device
             .build_output_stream(
                 &config,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = buffer.lock().unwrap();
                     let mut d = drift_out.lock().unwrap();
+                    let mut dg = diag_out.lock().unwrap();
                     let channels = 2usize;
+                    let target_ms = (cushion_out.load(Ordering::Relaxed) as f32).max(20.0);
+                    let target_samples =
+                        (target_ms / 1000.0 * sample_rate as f32) as usize * channels;
                     let queued: usize = buf.iter().map(|b| b.len()).sum();
+                    if d.primed {
+                        if queued < dg.min_q {
+                            dg.min_q = queued;
+                        }
+                        if queued > dg.max_q {
+                            dg.max_q = queued;
+                        }
+                        dg.sum_q += queued as f64;
+                        dg.count += 1;
+                        if dg.window.elapsed().as_secs() >= 5 {
+                            let avg = dg.sum_q / dg.count.max(1) as f64;
+                            let ms = |s: usize| {
+                                s as f64 * 1000.0 / (sample_rate as f64 * channels as f64)
+                            };
+                            println!(
+                                "[audio t={:.0}s] cola: min={:.1}ms avg={:.1}ms max={:.1}ms (target {:.0}ms)",
+                                dg.t(),
+                                ms(dg.min_q),
+                                ms(avg as usize),
+                                ms(dg.max_q),
+                                target_ms
+                            );
+                            dg.min_q = usize::MAX;
+                            dg.max_q = 0;
+                            dg.sum_q = 0.0;
+                            dg.count = 0;
+                            dg.window = Instant::now();
+                        }
+                    }
                     // priming: arrancar solo con colchón
                     if !d.primed {
                         if queued < target_samples {
@@ -212,11 +284,19 @@ impl AudioPlayback {
                         d.primed = true;
                     }
                     // corrección de deriva: exceso → consumir más rápido;
-                    // déficit → más lento (mantener ~target)
+                    // déficit → más lento (mantener ~target). Clamp
+                    // asimétrico (30/10): el device dropea audio en ráfagas
+                    // (~3ms/s promedio con video activo) y el refill a
+                    // -0.2% (2ms/s) no recuperaba entre ráfagas → la cola
+                    // vivía desangrada y los underruns seguían. Con -1% en
+                    // déficit profundo se recuperan 200ms en ~30s; cerca
+                    // del target el control es lineal (~-0.07% constante,
+                    // imperceptible) y el clamp ni se nota.
                     let err = queued as f32 - target_samples as f32;
                     let rate = 1.0 + (err / (target_samples as f32 * 40.0))
-                        .clamp(-0.002, 0.002);
+                        .clamp(-0.01, 0.002);
                     let frames_out = out.len() / channels;
+                    let mut silent_frames = 0usize;
                     for fi in 0..frames_out {
                         loop {
                             let need_next =
@@ -242,6 +322,7 @@ impl AudioPlayback {
                         let base = (d.frac_pos as usize) * channels;
                         if base + channels >= d.block.len() {
                             // sin más datos: silencio (hambre real)
+                            silent_frames += 1;
                             for ch in 0..channels {
                                 out[fi * channels + ch] = 0.0;
                             }
@@ -259,6 +340,14 @@ impl AudioPlayback {
                     if consumed > 0 && consumed < d.block.len() {
                         d.block.drain(..consumed);
                         d.frac_pos -= (consumed / channels) as f32;
+                    }
+                    if silent_frames > 0 && dg.last_underrun_log.elapsed().as_secs() >= 1 {
+                        println!(
+                            "[audio t={:.0}s] UNDERRUN: {silent_frames} frames silenciados ({:.1}ms), cola al inicio={queued} samples",
+                            dg.t(),
+                            silent_frames as f64 * 1000.0 / sample_rate as f64
+                        );
+                        dg.last_underrun_log = Instant::now();
                     }
                 },
                 |err| eprintln!("Audio output status: {err}"),
@@ -302,10 +391,15 @@ impl AudioPlayback {
         let cap = self.cap_samples.load(Ordering::Relaxed);
         if cap > 0 {
             let mut total: usize = buf.iter().map(|b| b.len()).sum();
+            let mut dropped_blocks = 0usize;
             while total > cap && buf.len() > 1 {
                 if let Some(d) = buf.pop_front() {
                     total -= d.len();
+                    dropped_blocks += 1;
                 }
+            }
+            if dropped_blocks > 0 {
+                println!("[audio] tope de cola: descartados {dropped_blocks} bloques (total {total} samples)");
             }
         }
     }
@@ -328,6 +422,10 @@ pub struct AudioCapture {
     start_time: Mutex<Option<Instant>>,
     playback: Arc<Mutex<Option<Arc<AudioPlayback>>>>,
     volume: Mutex<f32>,
+    /// Colchón base del playback en ms (0 = auto: ~2.2 bloques de entrada).
+    /// El colchón adaptativo puede elevarlo por encima si el device
+    /// dropea audio (MS2131: gaps ~100-220ms cada ~1min con video activo).
+    cushion_base_ms: AtomicU64,
 }
 
 impl AudioCapture {
@@ -358,7 +456,13 @@ impl AudioCapture {
             start_time: Mutex::new(None),
             playback: Arc::new(Mutex::new(None)),
             volume: Mutex::new(0.5),
+            cushion_base_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Fija el colchón base del playback (--audio-cushion-ms).
+    pub fn set_cushion_base_ms(&self, ms: u64) {
+        self.cushion_base_ms.store(ms.clamp(20, 500), Ordering::Relaxed);
     }
 
     pub fn start(&self) -> Result<AudioStreams> {
@@ -416,13 +520,18 @@ impl AudioCapture {
             sample_rate: SampleRate(sample_rate),
             buffer_size: if input_fixed { BufferSize::Fixed(input_bs) } else { BufferSize::Default },
         };
-        // target del colchón: ~2.2 bloques de entrada, mínimo 30ms
+        // target del colchón: ~2.2 bloques de entrada, mínimo 30ms; o el
+        // fijado por --audio-cushion-ms. El colchón ADAPTATIVO puede
+        // elevarlo después si el device dropea audio (ver abajo).
         let input_block_ms = if input_fixed {
             input_bs as f32 * 1000.0 / sample_rate as f32
         } else {
             85.0 // Default típico de CoreAudio (~4096 frames @48k)
         };
-        let target_ms = (input_block_ms * 2.2).max(30.0);
+        let base_ms = self.cushion_base_ms.load(Ordering::Relaxed);
+        let auto_ms = (input_block_ms * 2.2).max(30.0) as u64;
+        let cushion_ms = Arc::new(AtomicU64::new(if base_ms > 0 { base_ms } else { auto_ms }));
+        let target_ms = cushion_ms.load(Ordering::Relaxed) as f32;
 
         let ring = self.ring.clone();
         let total = self.total_captured.clone();
@@ -431,23 +540,60 @@ impl AudioCapture {
         let capacity = self.buffer_size_samples;
         let last_input_ms = Arc::new(AtomicU64::new(0));
         let last_input_ms_wd = last_input_ms.clone();
+        let cushion_in = cushion_ms.clone();
 
         // Constructor extraído: el watchdog reconstruye la entrada con los
         // MISMOS Arcs. `move`, dueño de sus capturas; vive en main thread
         // (cpal Device no es Send).
         let device_for_builder = device.clone();
         let config_for_builder = config.clone();
+        // Diagnóstico (30/10): gap entre callbacks de entrada (stall del
+        // dispositivo) y cambios de tamaño de bloque (renegociación).
+        let last_block_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_block_len_in = last_block_len.clone();
+        let cushion_gap = cushion_in.clone();
+        let t0_input = Instant::now();
         let make_input: Box<dyn Fn() -> Result<Stream>> = Box::new(move || {
             let ring = ring.clone();
             let total = total.clone();
             let playback_slot = playback_slot.clone();
             let last_input_ms = last_input_ms.clone();
+            let last_block_len = last_block_len_in.clone();
+            let cushion_gap = cushion_gap.clone();
             let config = config_for_builder.clone();
             device_for_builder
                 .build_input_stream(
                     &config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        last_input_ms.store(now_ms(), Ordering::Relaxed);
+                        let now = now_ms();
+                        let prev = last_input_ms.swap(now, Ordering::Relaxed);
+                        if prev != 0 && now.saturating_sub(prev) > 15 {
+                            let gap_ms = now - prev;
+                            println!(
+                                "[audio t={:.0}s] INPUT GAP: {gap_ms}ms desde el callback anterior",
+                                t0_input.elapsed().as_secs_f64()
+                            );
+                            // Colchón adaptativo: el gap observado define el
+                            // colchón necesario (gap + 50ms de margen, tope
+                            // 350ms). Monotónico: en una sesión solo sube.
+                            let cur = cushion_gap.load(Ordering::Relaxed);
+                            let needed = (gap_ms + 50).min(350);
+                            if needed > cur {
+                                cushion_gap.store(needed, Ordering::Relaxed);
+                                println!(
+                                    "[audio t={:.0}s] colchón adaptativo: {cur}ms → {needed}ms (gap {gap_ms}ms)",
+                                    t0_input.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+                        let prev_len = last_block_len.swap(data.len(), Ordering::Relaxed);
+                        if prev_len != 0 && prev_len != data.len() {
+                            println!(
+                                "[audio t={:.0}s] bloque de entrada cambió: {prev_len} -> {} samples (¿renegociación?)",
+                                t0_input.elapsed().as_secs_f64(),
+                                data.len()
+                            );
+                        }
                         let frames = data.len() / channels;
                         write_ring(&mut ring.lock().unwrap(), data, channels, capacity);
                         total.fetch_add(frames as u64, Ordering::Relaxed);
@@ -481,7 +627,7 @@ impl AudioCapture {
             playback.set_volume(volume);
             // bloque de salida pequeño también: aporta un bloque de latencia
             let out_bs = self.block_size.min(512);
-            match playback.start(sample_rate, out_bs, target_ms) {
+            match playback.start(sample_rate, out_bs, cushion_ms.clone()) {
                 Ok(out_stream) => {
                     *self.playback.lock().unwrap() = Some(playback);
                     playback_output = Some(out_stream);

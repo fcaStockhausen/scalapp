@@ -98,6 +98,18 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
 - ~~El autodetect de video (devices.rs) enumera 2560x1440@30 como
   "primera"~~ Resuelto en Fase 1: autodetect por query() + uniqueID,
   pidiendo 1080p60 exacto (reporta "USB3 Video 1920x1080@60fps").
+- **La MS2131 dropea audio isócrono mientras streamea video** (30/10):
+  ráfagas de 100-210ms cada ~1min (~3ms/s promedio), independiente de
+  resolución/fps (mismo ritmo a 1080p60 y 720p60); sin video activo,
+  0 gaps en 3min. Es firmware — no prevenible host-side, solo
+  amortiguable. Fix: colchón adaptativo en el playback (30ms base,
+  sube a gap+50ms al observar un gap, tope 350ms) + clamp de deriva
+  asimétrico (-1% en déficit profundo para recuperar entre ráfagas,
+  +0.2% en exceso; cerca del target el control es lineal ~-0.07%,
+  imperceptible). Resultado: 1 blip por sesión (el primer gap), el
+  resto absorbido. El audio queda a ~160-170ms de latencia → si el
+  lip-sync importa, retrasar el video para emparejar es un ítem
+  futuro (modo "latency tolerant" moderno).
 - audio.rs/passthrough.rs quedaron como referencia de motor probado
   (deriva compensada, watchdog, colchón adaptativo) — el video puede
   copiar el patrón de latest-wins del consumer.

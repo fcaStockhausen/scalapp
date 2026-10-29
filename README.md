@@ -56,6 +56,10 @@ scalapp --ultra-low-latency
 scalapp --video                            # auto-detecta capturadora
 scalapp --video-device 1 --monitor --latency 1.0
 
+# Colchón de audio en modo video (la capturadora dropea audio en ráfagas
+# con video activo; el colchón adaptativo lo cubre solo, esto fija la base)
+scalapp --video --audio-cushion-ms 150
+
 # Utilidades
 scalapp --list-devices           # lista capturadoras HDMI detectadas
 scalapp --test-audio             # prueba dispositivos con detección de señal

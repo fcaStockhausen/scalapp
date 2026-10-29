@@ -181,6 +181,14 @@ struct Args {
     #[arg(long = "stall-ms", default_value_t = 2000)]
     stall_ms: u64,
 
+    /// Colchón base del audio en modo video (ms). Por defecto auto (~30ms)
+    /// + colchón adaptativo: si el device dropea audio (MS2131 con video
+    /// activo: gaps ~100-220ms), el colchón sube solo hasta cubrirlos
+    /// (tope 350ms). Este flag fija la base; el adaptativo sigue subiendo
+    /// si hace falta. Más colchón = más latencia de audio.
+    #[arg(long = "audio-cushion-ms", default_value_t = 0)]
+    audio_cushion_ms: u64,
+
     #[arg(long)]
     ultra_low_latency: bool,
 
@@ -292,6 +300,10 @@ fn run(args: Args) -> Result<()> {
         audio_device_index,
         audio_only || ultra_low_latency,
     ));
+    if args.audio_cushion_ms > 0 {
+        audio_capture.set_cushion_base_ms(args.audio_cushion_ms);
+        println!("✓ Audio cushion base: {}ms", args.audio_cushion_ms);
+    }
     println!(
         "✓ Audio capture initialized: {}Hz, {} channels",
         args.audio_rate, 2
