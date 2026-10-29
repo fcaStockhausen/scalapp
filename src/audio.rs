@@ -520,7 +520,7 @@ impl AudioCapture {
             sample_rate: SampleRate(sample_rate),
             buffer_size: if input_fixed { BufferSize::Fixed(input_bs) } else { BufferSize::Default },
         };
-        // target del colchón: ~2.2 bloques de entrada, mínimo 30ms; o el
+        // target del colchón: ~2.2 bloques de entrada, mínimo 50ms; o el
         // fijado por --audio-cushion-ms. El colchón ADAPTATIVO puede
         // elevarlo después si el device dropea audio (ver abajo).
         let input_block_ms = if input_fixed {
@@ -529,7 +529,7 @@ impl AudioCapture {
             85.0 // Default típico de CoreAudio (~4096 frames @48k)
         };
         let base_ms = self.cushion_base_ms.load(Ordering::Relaxed);
-        let auto_ms = (input_block_ms * 2.2).max(30.0) as u64;
+        let auto_ms = (input_block_ms * 2.2).max(50.0) as u64;
         let cushion_ms = Arc::new(AtomicU64::new(if base_ms > 0 { base_ms } else { auto_ms }));
         let target_ms = cushion_ms.load(Ordering::Relaxed) as f32;
 

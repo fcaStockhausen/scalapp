@@ -181,7 +181,7 @@ struct Args {
     #[arg(long = "stall-ms", default_value_t = 2000)]
     stall_ms: u64,
 
-    /// Colchón base del audio en modo video (ms). Por defecto auto (~30ms)
+    /// Colchón base del audio en modo video (ms). Por defecto auto (~50ms)
     /// + colchón adaptativo: si el device dropea audio (MS2131 con video
     /// activo: gaps ~100-220ms), el colchón sube solo hasta cubrirlos
     /// (tope 350ms). Este flag fija la base; el adaptativo sigue subiendo

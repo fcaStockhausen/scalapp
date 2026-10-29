@@ -102,7 +102,7 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   ráfagas de 100-210ms cada ~1min (~3ms/s promedio), independiente de
   resolución/fps (mismo ritmo a 1080p60 y 720p60); sin video activo,
   0 gaps en 3min. Es firmware — no prevenible host-side, solo
-  amortiguable. Fix: colchón adaptativo en el playback (30ms base,
+  amortiguable. Fix: colchón adaptativo en el playback (50ms base,
   sube a gap+50ms al observar un gap, tope 350ms) + clamp de deriva
   asimétrico (-1% en déficit profundo para recuperar entre ráfagas,
   +0.2% en exceso; cerca del target el control es lineal ~-0.07%,
