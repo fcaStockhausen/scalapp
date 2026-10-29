@@ -99,8 +99,8 @@ impl AudioPlayback {
     }
 
     pub fn start(&self, sample_rate: u32, block_size: u32) -> Result<Stream> {
-        // tope por tiempo: ~0.75s de audio buffered, sea cual sea el
-        // tamaño de bloque de entrada
+        // tope de seguridad por tiempo (~0.75s) — con deriva compensada
+        // la cola vive cerca del objetivo, no del tope
         self.cap_samples.store(
             (0.75 * sample_rate as f32) as usize * self.channels,
             Ordering::Relaxed,
@@ -114,37 +114,91 @@ impl AudioPlayback {
             sample_rate: SampleRate(sample_rate),
             buffer_size: BufferSize::Fixed(block_size),
         };
+        // Motor 29/10: consumidor con DERIVA COMPENSADA portado del
+        // passthrough (validado semanas en audio-only). Los relojes de
+        // captura y salida derivan (cristales distintos): sin compensación
+        // la cola crece hasta el tope y el descarte = crackle digital.
+        // Interpolación lineal ±0.2% (inaudible) manteniendo la cola en
+        // ~TARGET_MS — delay bajo y estable, sin glitches.
+        struct Drift {
+            frac_pos: f32,
+            block: Vec<f32>,
+            primed: bool,
+        }
+        const TARGET_MS: f32 = 80.0;
+        let target_samples =
+            (TARGET_MS / 1000.0 * sample_rate as f32) as usize * self.channels;
+        let drift = Arc::new(Mutex::new(Drift {
+            frac_pos: 0.0,
+            block: Vec::new(),
+            primed: false,
+        }));
         let buffer = self.buffer.clone();
+        let drift_out = drift.clone();
         let stream = device
             .build_output_stream(
                 &config,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    // Fix 29/10: consumir FRAME-EXACTO acumulando entre
-                    // bloques de entrada (la entrada corre con
-                    // BufferSize::Default ~4096 frames y el match
-                    // bloque-a-bloque descartaba 3/4 de cada bloque =
-                    // distorsion total). Patron del router virtual del
-                    // passthrough: pop, copiar lo que entra, DEVOLVER el
-                    // resto a la cabeza de la cola.
                     let mut buf = buffer.lock().unwrap();
-                    let mut pos = 0;
-                    while pos < out.len() {
-                        match buf.pop_front() {
-                            Some(data) => {
-                                let n = data.len().min(out.len() - pos);
-                                out[pos..pos + n].copy_from_slice(&data[..n]);
-                                if n < data.len() {
-                                    buf.push_front(data[n..].to_vec());
-                                }
-                                pos += n;
+                    let mut d = drift_out.lock().unwrap();
+                    let channels = 2usize;
+                    let queued: usize = buf.iter().map(|b| b.len()).sum();
+                    // priming: arrancar solo con colchón
+                    if !d.primed {
+                        if queued < target_samples {
+                            out.fill(0.0);
+                            return;
+                        }
+                        d.primed = true;
+                    }
+                    // corrección de deriva: exceso → consumir más rápido;
+                    // déficit → más lento (mantener ~target)
+                    let err = queued as f32 - target_samples as f32;
+                    let rate = 1.0 + (err / (target_samples as f32 * 40.0))
+                        .clamp(-0.002, 0.002);
+                    let frames_out = out.len() / channels;
+                    for fi in 0..frames_out {
+                        loop {
+                            let need_next =
+                                d.block.len() > (d.frac_pos as usize + 2) * channels;
+                            if need_next
+                                || buf.is_empty()
+                                    && d.block.len() > (d.frac_pos as usize + 1) * channels
+                            {
+                                break;
                             }
-                            None => {
-                                for s in &mut out[pos..] {
-                                    *s = 0.0;
+                            match buf.pop_front() {
+                                Some(next) => {
+                                    if d.block.is_empty() {
+                                        d.block = next;
+                                        d.frac_pos = 0.0;
+                                    } else {
+                                        d.block.extend_from_slice(&next);
+                                    }
                                 }
-                                pos = out.len();
+                                None => break,
                             }
                         }
+                        let base = (d.frac_pos as usize) * channels;
+                        if base + channels >= d.block.len() {
+                            // sin más datos: silencio (hambre real)
+                            for ch in 0..channels {
+                                out[fi * channels + ch] = 0.0;
+                            }
+                            continue;
+                        }
+                        let t = d.frac_pos.fract();
+                        for ch in 0..channels {
+                            let a = d.block[base + ch];
+                            let b = d.block[base + channels + ch];
+                            out[fi * channels + ch] = a + (b - a) * t;
+                        }
+                        d.frac_pos += rate;
+                    }
+                    let consumed = (d.frac_pos as usize).saturating_sub(4) * channels;
+                    if consumed > 0 && consumed < d.block.len() {
+                        d.block.drain(..consumed);
+                        d.frac_pos -= (consumed / channels) as f32;
                     }
                 },
                 |err| eprintln!("Audio output status: {err}"),
