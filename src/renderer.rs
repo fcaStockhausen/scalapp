@@ -432,18 +432,22 @@ impl eframe::App for RendererApp {
                         crate::audio::user_volume_to_actual(self.volume_pct / 100.0) * 100.0
                     ));
                     ui.separator();
-                    ui.add(egui::Slider::new(&mut self.red_gain, 0.5..=1.5).text("Rojo"));
-                    ui.add(egui::Slider::new(&mut self.saturation, 0.0..=1.5).text("Saturación"));
+                    if ui
+                        .add(egui::Slider::new(&mut self.red_gain, 0.5..=1.5).text("Rojo"))
+                        .changed()
+                    {
+                        self.save_color_adjust();
+                    }
+                    if ui
+                        .add(egui::Slider::new(&mut self.saturation, 0.0..=1.5).text("Saturación"))
+                        .changed()
+                    {
+                        self.save_color_adjust();
+                    }
                     if ui.button("↺").clicked() {
                         self.red_gain = 1.0;
                         self.saturation = 1.0;
                         self.save_color_adjust();
-                    }
-                    if self.red_gain != 1.0 || self.saturation != 1.0 {
-                        // persistir al soltar (por cambio del slider)
-                        if ui.input(|i| i.pointer.any_released()) {
-                            self.save_color_adjust();
-                        }
                     }
                     let borderless_label = if self.borderless {
                         "Windowed Mode"

@@ -198,12 +198,13 @@ struct Args {
     #[arg(long = "audio-cushion-ms", default_value_t = 0)]
     audio_cushion_ms: u64,
 
-    /// Notch del hum del chip: con video streameando, la MS2131 acopla su
-    /// refresco vertical al audio (tono puro ~60 Hz + armónicos 120/180,
-    /// medido +7dB). Filtra 60.06/120.12/180.18 Hz con Q=25 (quirúrgico:
-    /// B1/B2 quedan a -1.8dB, el contenido del juego sobrevive).
-    #[arg(long = "notch-hum", default_value_t = false)]
-    notch_hum: bool,
+    /// Notch anti-hum del chip — DEFAULT ON: con video streameando, la
+    /// MS2131 acopla su refresco vertical al audio (tono puro ~60 Hz +
+    /// armónicos, medido +7dB). Filtra 60.06/120.12/180.18 Hz con Q=25
+    /// (quirúrgico: B1/B2 quedan a -1.8dB, el contenido del juego
+    /// sobrevive). Usá --no-notch-hum para desactivarlo.
+    #[arg(long = "no-notch-hum", action = clap::ArgAction::SetTrue, default_value_t = false)]
+    no_notch_hum: bool,
 
     /// High-pass opcional en Hz (default off): mata el rumor 28-38 Hz del
     /// chip PERO también colorea el bajo del contenido (HP 48: E1/41Hz
@@ -297,7 +298,7 @@ fn run(args: Args) -> Result<()> {
 
     if direct_passthrough {
         run_direct_passthrough(audio_device_index, args.block_size, args.virtual_out.clone(),
-                               args.delay_ms, args.stall_ms, args.notch_hum, args.hpf)?;
+                               args.delay_ms, args.stall_ms, !args.no_notch_hum, args.hpf)?;
         return Ok(());
     }
 
@@ -332,7 +333,7 @@ fn run(args: Args) -> Result<()> {
         audio_capture.set_cushion_base_ms(args.audio_cushion_ms);
         println!("✓ Audio cushion base: {}ms", args.audio_cushion_ms);
     }
-    audio_capture.set_notch_hum(args.notch_hum);
+    audio_capture.set_notch_hum(!args.no_notch_hum);
     audio_capture.set_hpf(args.hpf);
     println!(
         "✓ Audio capture initialized: {}Hz, {} channels",

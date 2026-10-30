@@ -50,27 +50,29 @@ scalapp --block-size 128   # ~4ms
 scalapp --block-size 512   # ~13ms
 
 # Arrancar con ventana borderless — sin barra de título ni bordes
-# (NO fullscreen: la ventana conserva tamaño y posición). Volumen default 20%.
-scalapp --video --borderless --notch-hum
+# (NO fullscreen: la ventana conserva tamaño y posición). El notch
+# anti-hum y la calibración de color van por defecto.
+scalapp --video --borderless
 
 # Ultra-low latency (8ms, sin passthrough directo)
 scalapp --ultra-low-latency
 
-# Modo completo A/V sincronizado
+# Modo completo A/V sincronizado — el notch anti-hum va por defecto
 scalapp --video                            # auto-detecta capturadora
-scalapp --video-device 1 --monitor --latency 1.0
+scalapp --video --no-notch-hum             # sin filtro (audio "virgen")
 
 # Colchón de audio en modo video (la capturadora dropea audio en ráfagas
 # con video activo; el colchón adaptativo lo cubre solo, esto fija la base)
 scalapp --video --audio-cushion-ms 150
 
-# Filtro anti-hum del chip (tono ~60Hz + armónicos con video streameando).
-# Quirúrgico: Q=25 toca B1/B2 a menos de -2dB, el resto del audio intacto.
-scalapp --video --notch-hum
+# El notch anti-hum (tono ~60Hz + armónicos con video streameando) va
+# ON por defecto desde 29/10 — quirúrgico: Q=25 toca B1/B2 a menos de
+# -2dB, el resto del audio intacto. Para audio "virgen":
+scalapp --video --no-notch-hum
 
 # + high-pass opcional para el rumor 28-38Hz (cuesta sub-bajo del contenido:
 # con 48Hz, E1/41Hz -9dB, A1/55Hz -4dB) — solo si el sub-bajo no importa
-scalapp --video --notch-hum --hpf 48
+scalapp --video --hpf 48
 
 # Utilidades
 scalapp --list-devices           # lista capturadoras HDMI detectadas
