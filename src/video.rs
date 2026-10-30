@@ -29,6 +29,12 @@ pub struct CaptureStats {
     /// frame más nuevo.
     pub skipped_frames: u64,
     pub last_frame_time: Option<f64>,
+    /// Diagnóstico de PACING (judder): distribución de los deltas de
+    /// llegada en la ventana actual. fps promedio 60 con deltas
+    /// desparejos = video que se ve a 30-40 aunque el contador diga 60.
+    pub pacing_bursts: u64,
+    pub pacing_gaps: u64,
+    pub pacing_p50_ms: f32,
 }
 
 struct StatsInner {
@@ -38,6 +44,11 @@ struct StatsInner {
     fps_frame_count: u64,
     last_fps_time: Instant,
     last_frame_time: Option<f64>,
+    // pacing: deltas de llegada (ventana móvil)
+    pacing_last: Option<f64>,
+    pacing_bursts: u64,
+    pacing_gaps: u64,
+    pacing_deltas_ms: Vec<f32>,
 }
 
 impl StatsInner {
@@ -49,7 +60,42 @@ impl StatsInner {
             fps_frame_count: 0,
             last_fps_time: Instant::now(),
             last_frame_time: None,
+            pacing_last: None,
+            pacing_bursts: 0,
+            pacing_gaps: 0,
+            pacing_deltas_ms: Vec::new(),
         }
+    }
+
+    /// Registra el delta entre frames consecutivos. A 60fps sano: ~16.7ms
+    /// uniformes. Ráfagas (<8ms) seguidas de huecos (>25ms) = judder
+    /// aunque el promedio dé 60.
+    fn record_pacing(&mut self, timestamp: f64) {
+        if let Some(prev) = self.pacing_last.replace(timestamp) {
+            let delta_ms = ((timestamp - prev) * 1000.0) as f32;
+            if delta_ms < 8.0 {
+                self.pacing_bursts += 1;
+            }
+            if delta_ms > 25.0 {
+                self.pacing_gaps += 1;
+            }
+            self.pacing_deltas_ms.push(delta_ms);
+            // ventana móvil ~15s de deltas
+            let max = 15 * 120;
+            if self.pacing_deltas_ms.len() > max {
+                let drop = self.pacing_deltas_ms.len() - max;
+                self.pacing_deltas_ms.drain(..drop);
+            }
+        }
+    }
+
+    fn pacing_p50_ms(&self) -> f32 {
+        if self.pacing_deltas_ms.is_empty() {
+            return 0.0;
+        }
+        let mut v = self.pacing_deltas_ms.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
     }
 }
 
@@ -318,6 +364,7 @@ impl VideoCapture {
                         }
                         let mut stats = self.stats.lock().unwrap();
                         stats.last_frame_time = Some(timestamp);
+                        stats.record_pacing(timestamp);
                         stats.fps_frame_count += 1;
                         let now = Instant::now();
                         let elapsed = now.duration_since(stats.last_fps_time).as_secs_f64();
@@ -378,6 +425,9 @@ impl VideoCapture {
             total_frames: stats.frame_count,
             skipped_frames: stats.skipped_frames,
             last_frame_time: stats.last_frame_time,
+            pacing_bursts: stats.pacing_bursts,
+            pacing_gaps: stats.pacing_gaps,
+            pacing_p50_ms: stats.pacing_p50_ms(),
         }
     }
 }

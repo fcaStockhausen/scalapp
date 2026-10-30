@@ -43,26 +43,67 @@ impl FpsMeter {
 /// fundamental del direct output, visible en consola.
 struct VideoHealth {
     last: Instant,
+    /// contadores previos para reportar DELTAS por ventana (los
+    /// contadores de origen son acumulativos)
+    prev_skip: u64,
+    prev_cap_bursts: u64,
+    prev_cap_gaps: u64,
+    prev_paint_bursts: u64,
+    prev_paint_gaps: u64,
 }
 
 impl VideoHealth {
     fn new() -> Self {
         Self {
             last: Instant::now(),
+            prev_skip: 0,
+            prev_cap_bursts: 0,
+            prev_cap_gaps: 0,
+            prev_paint_bursts: 0,
+            prev_paint_gaps: 0,
         }
     }
 
-    fn maybe_report(&mut self, cap_fps: f32, out_fps: f32, loop_fps: f32, skipped: u64, target: u32) {
-        if self.last.elapsed().as_secs() >= 15 {
-            println!(
-                "[video @{}] cap {:.1} | out {:.1} | loop {:.1} | skipped {skipped} (target {target})",
-                crate::audio::wall_clock(),
-                cap_fps,
-                out_fps,
-                loop_fps,
-            );
-            self.last = Instant::now();
+    fn maybe_report(
+        &mut self,
+        cap_fps: f32,
+        out_fps: f32,
+        loop_fps: f32,
+        skipped: u64,
+        pacing: (u64, u64, f32),
+        paint: (u64, u64, f32),
+        paint_tail: (f32, f32),
+        target: u32,
+    ) {
+        if self.last.elapsed().as_secs() < 15 {
+            return;
         }
+        // deltas por ventana (la "ráfaga" acumulada desde el arranque
+        // no dice nada del comportamiento actual)
+        let (skip, cb, cg, pb, pg) = (
+            skipped - self.prev_skip,
+            pacing.0 - self.prev_cap_bursts,
+            pacing.1 - self.prev_cap_gaps,
+            paint.0 - self.prev_paint_bursts,
+            paint.1 - self.prev_paint_gaps,
+        );
+        self.prev_skip = skipped;
+        self.prev_cap_bursts = pacing.0;
+        self.prev_cap_gaps = pacing.1;
+        self.prev_paint_bursts = paint.0;
+        self.prev_paint_gaps = paint.1;
+        println!(
+            "[video @{}] cap {:.1} | out {:.1} | loop {:.1} | skip +{skip} | llegada: +{cb}ráf +{cg}huec p50 {:.1} | pintado: +{pb}ráf +{pg}huec p10 {:.1} p50 {:.1} p90 {:.1}ms (target {target})",
+            crate::audio::wall_clock(),
+            cap_fps,
+            out_fps,
+            loop_fps,
+            pacing.2,
+            paint_tail.0,
+            paint.2,
+            paint_tail.1,
+        );
+        self.last = Instant::now();
     }
 }
 
@@ -71,6 +112,12 @@ pub struct RendererApp {
     video: Arc<VideoCapture>,
     texture: egui::TextureHandle,
     last_frame_number: u64,
+    /// Diagnóstico de pacing de PINTADO (judder): deltas entre frames
+    /// nuevos pintados.
+    last_paint: Option<Instant>,
+    paint_bursts: u64,
+    paint_gaps: u64,
+    paint_deltas_ms: Vec<f32>,
     /// Buffer RGBA reutilizado frame a frame (sin realloc por frame).
     rgba: Vec<u8>,
     texture_size: [usize; 2],
@@ -111,6 +158,10 @@ impl RendererApp {
             video,
             texture,
             last_frame_number: u64::MAX,
+            last_paint: None,
+            paint_bursts: 0,
+            paint_gaps: 0,
+            paint_deltas_ms: Vec::new(),
             rgba: Vec::new(),
             texture_size: [1, 1],
             show_overlay: false,
@@ -135,6 +186,21 @@ impl RendererApp {
         };
         if frame.frame_number == self.last_frame_number {
             return;
+        }
+        let paint_now = Instant::now();
+        if let Some(prev) = self.last_paint.replace(paint_now) {
+            let delta = paint_now.duration_since(prev).as_secs_f32() * 1000.0;
+            if delta < 8.0 {
+                self.paint_bursts += 1;
+            }
+            if delta > 25.0 {
+                self.paint_gaps += 1;
+            }
+            self.paint_deltas_ms.push(delta);
+            if self.paint_deltas_ms.len() > 15 * 120 {
+                let drop = self.paint_deltas_ms.len() - 15 * 120;
+                self.paint_deltas_ms.drain(..drop);
+            }
         }
         let w = frame.width as usize;
         let h = frame.height as usize;
@@ -346,11 +412,22 @@ impl eframe::App for RendererApp {
 
         self.pull_frame();
         let cap_stats = self.video.get_capture_stats();
+        let mut paint_deltas = std::mem::take(&mut self.paint_deltas_ms);
+        let mut paint_pct = |p: usize| -> f32 {
+            if paint_deltas.is_empty() {
+                return 0.0;
+            }
+            paint_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            paint_deltas[(paint_deltas.len() - 1) * p / 100]
+        };
         self.health.maybe_report(
             cap_stats.fps_actual,
             self.painted_fps.fps,
             self.loop_fps.fps,
             cap_stats.skipped_frames,
+            (cap_stats.pacing_bursts, cap_stats.pacing_gaps, cap_stats.pacing_p50_ms),
+            (self.paint_bursts, self.paint_gaps, paint_pct(50)),
+            (paint_pct(10), paint_pct(90)),
             self.video.fps,
         );
         self.update_status();
