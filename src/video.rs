@@ -329,6 +329,9 @@ impl VideoCapture {
         let resolution = camera.resolution();
         let actual_fps = camera.frame_rate() as f32;
         let start_time = Instant::now();
+        // dump crudo de YUYV para diagnóstico de color (SCALAPP_RAW_DUMP)
+        let raw_dump = std::env::var("SCALAPP_RAW_DUMP").ok();
+        let raw_count = Arc::new(Mutex::new(0u32));
         *self.clock_origin.lock().unwrap() = Some(start_time);
         let _ = tx.send(Ok((resolution.width_x, resolution.height_y, actual_fps)));
         println!(
@@ -343,7 +346,19 @@ impl VideoCapture {
 
         while self.running.load(Ordering::Relaxed) {
             match camera.frame() {
-                Ok(frame_buffer) => match frame_buffer.decode_image::<RgbFormat>() {
+                Ok(frame_buffer) => {
+                    // dump crudo para diagnóstico de color (SCALAPP_RAW_DUMP):
+                    // guarda N frames YUYV sin decodificar
+                    if let Some(path) = &raw_dump {
+                        let mut d = raw_count.lock().unwrap();
+                        if *d < 5 {
+                            let p = format!("{}_{:02}.yuyv", path, *d);
+                            let _ = std::fs::write(&p, frame_buffer.buffer());
+                            println!("[raw-dump] {p} ({} bytes)", frame_buffer.buffer().len());
+                            *d += 1;
+                        }
+                    }
+                    match frame_buffer.decode_image::<RgbFormat>() {
                     Ok(image) => {
                         let width = image.width();
                         let height = image.height();
@@ -378,6 +393,7 @@ impl VideoCapture {
                     Err(e) => {
                         eprintln!("Frame decode error: {e}");
                         std::thread::sleep(Duration::from_millis(10));
+                    }
                     }
                 },
                 Err(_) => {

@@ -133,6 +133,12 @@ pub struct RendererApp {
     loop_fps: FpsMeter,
     /// Línea de salud cada 15s en consola.
     health: VideoHealth,
+    /// Ajuste de color por ojo (la MS2131 + YUYV puede correr levemente
+    /// al rojo vs el monitor físico — referencia del usuario):
+    /// red_gain multiplica el canal R, saturation mezcla hacia la luma.
+    /// 1.0/1.0 = neutro. Persiste en ~/.scalapp_color.
+    red_gain: f32,
+    saturation: f32,
 }
 
 impl RendererApp {
@@ -153,7 +159,7 @@ impl RendererApp {
         // (los bursts del device ya no se pierden entre timers).
         let ctx_for_video = cc.egui_ctx.clone();
         video.set_frame_notifier(Some(Box::new(move || ctx_for_video.request_repaint())));
-        Self {
+        let mut app = Self {
             sync,
             video,
             texture,
@@ -175,7 +181,46 @@ impl RendererApp {
             painted_fps: FpsMeter::new(),
             loop_fps: FpsMeter::new(),
             health: VideoHealth::new(),
+            red_gain: 1.0,
+            saturation: 1.0,
+        };
+        app.load_color_adjust();
+        app
+    }
+
+    fn color_adjust_path() -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        p.push(".scalapp_color");
+        p
+    }
+
+    fn load_color_adjust(&mut self) {
+        let Ok(text) = std::fs::read_to_string(Self::color_adjust_path()) else {
+            return;
+        };
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("red ") {
+                if let Ok(f) = v.trim().parse::<f32>() {
+                    self.red_gain = f.clamp(0.5, 1.5);
+                }
+            }
+            if let Some(v) = line.strip_prefix("sat ") {
+                if let Ok(f) = v.trim().parse::<f32>() {
+                    self.saturation = f.clamp(0.0, 1.5);
+                }
+            }
         }
+        println!(
+            "✓ Ajuste de color: rojo x{:.2} saturación x{:.2}",
+            self.red_gain, self.saturation
+        );
+    }
+
+    fn save_color_adjust(&self) {
+        let _ = std::fs::write(
+            Self::color_adjust_path(),
+            format!("red {:.3}\nsat {:.3}\n", self.red_gain, self.saturation),
+        );
     }
 
     /// Latest-wins: toma SIEMPRE el último frame del slot de captura.
@@ -210,11 +255,28 @@ impl RendererApp {
         }
         // RGB → RGBA en buffer reutilizado (el alpha queda fijado en 255)
         self.rgba.resize(w * h * 4, 255);
+        let rg = self.red_gain;
+        let sat = self.saturation;
+        let neutral = (rg - 1.0).abs() < 1e-3 && (sat - 1.0).abs() < 1e-3;
         let src_pixels = frame.data.as_chunks::<3>().0;
-        for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
+        if neutral {
+            for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+            }
+        } else {
+            // ajuste de color por ojo: gain de R + mezcla hacia luma
+            // (saturación) — calibrado contra el monitor físico
+            for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
+                let r = src[0] as f32 * rg;
+                let g = src[1] as f32;
+                let b = src[2] as f32;
+                let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                dst[0] = (luma + (r - luma) * sat).clamp(0.0, 255.0) as u8;
+                dst[1] = (luma + (g - luma) * sat).clamp(0.0, 255.0) as u8;
+                dst[2] = (luma + (b - luma) * sat).clamp(0.0, 255.0) as u8;
+            }
         }
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.rgba);
         self.texture.set(image, egui::TextureOptions::LINEAR);
@@ -369,6 +431,20 @@ impl eframe::App for RendererApp {
                         "(real {:.0}%)",
                         crate::audio::user_volume_to_actual(self.volume_pct / 100.0) * 100.0
                     ));
+                    ui.separator();
+                    ui.add(egui::Slider::new(&mut self.red_gain, 0.5..=1.5).text("Rojo"));
+                    ui.add(egui::Slider::new(&mut self.saturation, 0.0..=1.5).text("Saturación"));
+                    if ui.button("↺").clicked() {
+                        self.red_gain = 1.0;
+                        self.saturation = 1.0;
+                        self.save_color_adjust();
+                    }
+                    if self.red_gain != 1.0 || self.saturation != 1.0 {
+                        // persistir al soltar (por cambio del slider)
+                        if ui.input(|i| i.pointer.any_released()) {
+                            self.save_color_adjust();
+                        }
+                    }
                     let borderless_label = if self.borderless {
                         "Windowed Mode"
                     } else {
