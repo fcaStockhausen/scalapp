@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleRate, Stream, StreamConfig};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -190,7 +190,7 @@ fn now_ms() -> u64 {
 
 /// HH:MM:SS de reloj de pared LOCAL — para correlacionar los eventos de
 /// audio con logs externos (formatguard, consola).
-fn wall_clock() -> String {
+pub(crate) fn wall_clock() -> String {
     unsafe {
         let t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();

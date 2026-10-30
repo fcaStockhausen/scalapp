@@ -87,6 +87,11 @@ pub struct VideoCapture {
     /// formato exacto se escaldean otros. Un dispositivo sin el modo
     /// pedido falla el open en vez de mostrar la cámara equivocada.
     allow_index_scan: bool,
+    /// Notificador de frame nuevo (Fase 2-lite): el thread de captura lo
+    /// llama al almacenar cada frame — el renderer lo usa para disparar
+    /// el repaint EXACTO cuando hay algo nuevo que pintar (adiós a
+    /// perder frames por ráfagas entre repaints por timer).
+    frame_notifier: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
     /// Single-slot latest-wins: el consumidor toma SIEMPRE el último frame,
     /// la latencia de cola es 0 por construcción.
     latest: Arc<Mutex<Option<Arc<TimestampedFrame>>>>,
@@ -109,6 +114,7 @@ impl VideoCapture {
             height,
             fps,
             allow_index_scan: true,
+            frame_notifier: Arc::new(Mutex::new(None)),
             latest: Arc::new(Mutex::new(None)),
             frame_seq: Arc::new(AtomicU64::new(0)),
             displayed: Arc::new(AtomicU64::new(0)),
@@ -117,6 +123,13 @@ impl VideoCapture {
             running: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
         }
+    }
+
+    /// Registra el callback de "frame nuevo" (lo llama el thread de
+    /// captura por frame almacenado). El renderer instala
+    /// `ctx.request_repaint()` para pintar exactamente cuando llega.
+    pub fn set_frame_notifier(&self, cb: Option<Box<dyn Fn() + Send>>) {
+        *self.frame_notifier.lock().unwrap() = cb;
     }
 
     /// Desactiva el escaneo de índices cuando el usuario eligió el
@@ -297,6 +310,12 @@ impl VideoCapture {
                             frame_number: self.frame_seq.fetch_add(1, Ordering::Relaxed),
                         };
                         store_frame(&self.latest, &self.displayed, &self.stats, frame);
+                        // Fase 2-lite: el arrival del frame dispara el
+                        // repaint del renderer (pintar exactamente cuando
+                        // hay frame nuevo, no cuando el timer se dé)
+                        if let Some(cb) = self.frame_notifier.lock().unwrap().as_ref() {
+                            cb();
+                        }
                         let mut stats = self.stats.lock().unwrap();
                         stats.last_frame_time = Some(timestamp);
                         stats.fps_frame_count += 1;

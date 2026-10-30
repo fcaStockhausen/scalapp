@@ -13,6 +13,7 @@ struct FpsMeter {
     count: u64,
     fps: f32,
     last: Instant,
+    report: Instant,
 }
 
 impl FpsMeter {
@@ -21,6 +22,7 @@ impl FpsMeter {
             count: 0,
             fps: 0.0,
             last: Instant::now(),
+            report: Instant::now(),
         }
     }
 
@@ -32,6 +34,34 @@ impl FpsMeter {
             self.fps = self.count as f32 / elapsed;
             self.count = 0;
             self.last = now;
+        }
+    }
+}
+
+/// Línea de salud del pipeline cada 15s: cap (entrega del device) vs
+/// out (frames nuevos pintados) vs loop (repaints) — la métrica
+/// fundamental del direct output, visible en consola.
+struct VideoHealth {
+    last: Instant,
+}
+
+impl VideoHealth {
+    fn new() -> Self {
+        Self {
+            last: Instant::now(),
+        }
+    }
+
+    fn maybe_report(&mut self, cap_fps: f32, out_fps: f32, loop_fps: f32, skipped: u64, target: u32) {
+        if self.last.elapsed().as_secs() >= 15 {
+            println!(
+                "[video @{}] cap {:.1} | out {:.1} | loop {:.1} | skipped {skipped} (target {target})",
+                crate::audio::wall_clock(),
+                cap_fps,
+                out_fps,
+                loop_fps,
+            );
+            self.last = Instant::now();
         }
     }
 }
@@ -50,10 +80,12 @@ pub struct RendererApp {
     borderless: bool,
     status_text: String,
     audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
-    /// Frames NUEVOS pintados por segundo (lo que realmente llega a pantalla).
+    /// Contador de fps del RENDER (frames pintados).
     painted_fps: FpsMeter,
     /// Repaints por segundo del loop de egui.
     loop_fps: FpsMeter,
+    /// Línea de salud cada 15s en consola.
+    health: VideoHealth,
 }
 
 impl RendererApp {
@@ -69,6 +101,11 @@ impl RendererApp {
             egui::ColorImage::new([1, 1], Color32::BLACK),
             egui::TextureOptions::LINEAR,
         );
+        // Fase 2-lite: cada frame que llega dispara el repaint — el
+        // render ocurre exactamente cuando hay algo nuevo que pintar
+        // (los bursts del device ya no se pierden entre timers).
+        let ctx_for_video = cc.egui_ctx.clone();
+        video.set_frame_notifier(Some(Box::new(move || ctx_for_video.request_repaint())));
         Self {
             sync,
             video,
@@ -84,6 +121,7 @@ impl RendererApp {
             audio_streams,
             painted_fps: FpsMeter::new(),
             loop_fps: FpsMeter::new(),
+            health: VideoHealth::new(),
         }
     }
 
@@ -296,6 +334,14 @@ impl eframe::App for RendererApp {
         }
 
         self.pull_frame();
+        let cap_stats = self.video.get_capture_stats();
+        self.health.maybe_report(
+            cap_stats.fps_actual,
+            self.painted_fps.fps,
+            self.loop_fps.fps,
+            cap_stats.skipped_frames,
+            self.video.fps,
+        );
         self.update_status();
         // Fase 1: 8ms mientras llega el repaint dirigido por frames (Fase 2)
         ctx.request_repaint_after(Duration::from_millis(8));

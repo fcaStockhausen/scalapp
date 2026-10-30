@@ -85,14 +85,19 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   además todos los opens van bajo catch_unwind. En USB2 el mejor modo
   seguro es 800x600@60 (o 1080p@10 con --video-fps 10).
 
-### Fase 2 — Push en vez de poll
+### Fase 2 — Push en vez de poll (medio hecha: 29/10)
 - [ ] Reemplazar nokhwa por **AVFoundation con delegate**
       (AVCaptureVideoDataOutput entrega CMSampleBuffer por callback:
       push, sin polling, sin decode CPU — llega BGRA listo).
       Opciones: nokhwa moderno si ya lo soporta limpio, o binding
       directo objc2-avfoundation.
-- [ ] El callback del frame **dispara el repaint** (ctx.request_repaint
-      via waker): renderizamos exactamente cuando hay frame nuevo.
+- [x] El callback del frame **dispara el repaint** (ctx.request_repaint
+      via notifier del thread de captura — 29/10): el render ocurre
+      exactamente cuando hay frame nuevo. Implementado sin reescribir
+      nokhwa: el thread de captura llama un notifier al almacenar en
+      el slot latest-wins. Resultado medido: out 60.0-60.7 estable
+      (antes caía a ~40 cuando el loop de repaint decaía y perdía
+      ráfagas). El repaint por timer (8ms) queda como heartbeat.
 
 ### Fase 3 — Zero-copy (el "direct output" de verdad)
 - [ ] CVPixelBuffer → Metal texture via CVOpenGLTextureCache /
