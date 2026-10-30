@@ -83,7 +83,7 @@ scalapp --test-audio             # prueba dispositivos con detección de señal
 
 ### Controles modo A/V (ventana)
 
-Checkboxes **Show Overlay**/**Show Stats**, slider de volumen, botón **Borderless Mode**, **Quit**.
+Checkboxes **Show Overlay**/**Show Stats** (Stats también muestra la barra de diagnóstico abajo), slider de volumen, botón **Borderless Mode**, **Quit**.
 Teclas: `F` borderless (sin barra de título, no fullscreen) · `O` overlay · `S` stats · `Esc` volver a ventana normal · `Q` salir.
 
 ## Módulos

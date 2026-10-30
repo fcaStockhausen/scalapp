@@ -271,11 +271,15 @@ impl eframe::App for RendererApp {
             });
         }
 
-        egui::TopBottomPanel::bottom("status")
-            .show_separator_line(!self.borderless)
-            .show(ctx, |ui| {
-                ui.label(&self.status_text);
-            });
+        // barra de status (Audio/Video/A-V diff): solo en modo diagnóstico
+        // (Show Stats / S) y con ventana decorada — el monitor queda limpio
+        if self.show_stats && !self.borderless {
+            egui::TopBottomPanel::bottom("status")
+                .show_separator_line(true)
+                .show(ctx, |ui| {
+                    ui.label(&self.status_text);
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
