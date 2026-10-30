@@ -27,6 +27,21 @@ pub fn scale_volume(volume: f32) -> f32 {
     }
 }
 
+/// Rango físico útil del volumen: la escala de UI (0-100%) se mapea a
+/// este rango — arriba de ~30% la señal satura y no se usa. Así la
+/// slider recorre con resolución el intervalo que realmente se ajusta.
+pub const VOLUME_RANGE: f32 = 0.30;
+
+/// usuario (0.0-1.0) → volumen físico del motor (0.0-VOLUME_RANGE)
+pub fn user_volume_to_actual(u: f32) -> f32 {
+    u.clamp(0.0, 1.0) * VOLUME_RANGE
+}
+
+/// volumen físico → escala de usuario (para defaults y display)
+pub fn actual_volume_to_user(a: f32) -> f32 {
+    (a / VOLUME_RANGE).clamp(0.0, 1.0)
+}
+
 struct Ring {
     buf: Vec<f32>,
     write: usize,
@@ -988,6 +1003,17 @@ mod tests {
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn volume_user_scale_maps_to_physical_range() {
+        // 0-100 de la UI recorre 0-30% físico completo
+        assert!((user_volume_to_actual(0.0)).abs() < 1e-6);
+        assert!((user_volume_to_actual(1.0) - VOLUME_RANGE).abs() < 1e-6);
+        assert!((user_volume_to_actual(0.5) - 0.15).abs() < 1e-6);
+        // roundtrip: el default 20% físico se expresa como 2/3 de la UI
+        assert!((actual_volume_to_user(0.2) - 0.2 / VOLUME_RANGE).abs() < 1e-6);
+        assert!(user_volume_to_actual(actual_volume_to_user(0.25)) - 0.25 < 1e-6);
     }
 
     #[test]

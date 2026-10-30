@@ -80,6 +80,7 @@ scalapp --test-audio             # prueba dispositivos con detección de señal
 ### Controles modo audio-only (consola)
 
 `v`/`V`: bajar/subir volumen · `0-9`: volumen fijo · `m`: mute · `q`: salir
+(La escala 0-100% de la UI y de los comandos mapea al rango físico **0-30%** — arriba de eso satura; el % real se muestra junto al valor.)
 
 ### Controles modo A/V (ventana)
 

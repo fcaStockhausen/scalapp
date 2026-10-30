@@ -61,13 +61,21 @@ fn parse_volume_cmd(raw: &str) -> Option<VolumeCmd> {
 }
 
 fn volume_console_loop<T: VolumeTarget>(target: &mut T, mut streams: Option<&mut passthrough::PassthroughStreams>) {
-    let mut current_volume = 0.2f32;
+    // escala de UI 0.0-1.0 → rango físico 0-VOLUME_RANGE (30%):
+    // toda la resolución en el intervalo que se usa
+    let mut current_volume = audio::actual_volume_to_user(0.2); // = 20% físico
     let mut is_muted = false;
-    let mut muted_volume = 0.2f32;
-    target.set_volume(current_volume);
-    println!("✓ Volume set to {}%", (current_volume * 100.0) as i32);
-    println!("Volume: {}% {} | Command (v/V/m/q/0-9): ",
+    let mut muted_volume = audio::actual_volume_to_user(0.2);
+    let apply = |t: &mut T, u: f32| t.set_volume(audio::user_volume_to_actual(u));
+    apply(target, current_volume);
+    println!(
+        "✓ Volume set to {}% (real {:.0}%)",
+        (current_volume * 100.0) as i32,
+        audio::user_volume_to_actual(current_volume) * 100.0
+    );
+    println!("Volume: {}% (real {:.0}%) {} | Command (v/V/m/q/0-9): ",
              (current_volume * 100.0) as i32,
+             audio::user_volume_to_actual(current_volume) * 100.0,
              if is_muted { "(MUTED)" } else { "" });
 
     // stdin en un thread + tick de 200ms: el tick atiende los pedidos de
@@ -122,9 +130,10 @@ fn volume_console_loop<T: VolumeTarget>(target: &mut T, mut streams: Option<&mut
             }
             None => {}
         }
-        target.set_volume(current_volume);
-        println!("Volume: {}% {} | Command (v/V/m/q/0-9): ",
+        apply(target, current_volume);
+        println!("Volume: {}% (real {:.0}%) {} | Command (v/V/m/q/0-9): ",
                  (current_volume * 100.0) as i32,
+                 audio::user_volume_to_actual(current_volume) * 100.0,
                  if is_muted { "(MUTED)" } else { "" });
     }
     println!("\nStopping audio monitor...");

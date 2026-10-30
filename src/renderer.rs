@@ -115,7 +115,9 @@ impl RendererApp {
             texture_size: [1, 1],
             show_overlay: false,
             show_stats: false,
-            volume_pct: 20.0,
+            // 67% de la escala UI = 20% físico (mantiene la sonoridad
+            // default de siempre dentro del nuevo mapeo 0-100 → 0-30)
+            volume_pct: crate::audio::actual_volume_to_user(0.2) * 100.0,
             borderless,
             status_text: "Initializing...".into(),
             audio_streams,
@@ -290,8 +292,17 @@ impl eframe::App for RendererApp {
                         ))
                         .changed()
                     {
-                        self.sync.set_audio_volume(self.volume_pct / 100.0);
+                        // escala de UI 0-100 → rango físico 0-VOLUME_RANGE
+                        // (30%): toda la resolución del slider en el
+                        // intervalo que realmente se usa
+                        let actual =
+                            crate::audio::user_volume_to_actual(self.volume_pct / 100.0);
+                        self.sync.set_audio_volume(actual);
                     }
+                    ui.label(format!(
+                        "(real {:.0}%)",
+                        crate::audio::user_volume_to_actual(self.volume_pct / 100.0) * 100.0
+                    ));
                     let borderless_label = if self.borderless {
                         "Windowed Mode"
                     } else {
