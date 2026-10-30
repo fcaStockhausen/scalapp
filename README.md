@@ -49,8 +49,9 @@ scalapp
 scalapp --block-size 128   # ~4ms
 scalapp --block-size 512   # ~13ms
 
-# Arrancar directo en fullscreen (volumen default 20%)
-scalapp --video --borderless
+# Arrancar con ventana borderless — sin barra de título ni bordes
+# (NO fullscreen: la ventana conserva tamaño y posición). Volumen default 20%.
+scalapp --video --borderless --notch-hum
 
 # Ultra-low latency (8ms, sin passthrough directo)
 scalapp --ultra-low-latency
@@ -83,7 +84,7 @@ scalapp --test-audio             # prueba dispositivos con detección de señal
 ### Controles modo A/V (ventana)
 
 Checkboxes **Show Overlay**/**Show Stats**, slider de volumen, botón **Borderless Mode**, **Quit**.
-Teclas: `F` borderless/fullscreen · `O` overlay · `S` stats · `Esc` salir de fullscreen · `Q` salir.
+Teclas: `F` borderless (sin barra de título, no fullscreen) · `O` overlay · `S` stats · `Esc` volver a ventana normal · `Q` salir.
 
 ## Módulos
 

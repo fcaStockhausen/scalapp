@@ -202,8 +202,9 @@ struct Args {
     #[arg(long = "hpf", default_value_t = 0)]
     hpf: u32,
 
-    /// Iniciar directamente en modo borderless/fullscreen (equivale a
-    /// presionar F al abrir; Esc vuelve a ventana).
+    /// Iniciar con ventana borderless: SIN barra de título ni bordes (no
+    /// es fullscreen — la ventana conserva tamaño y posición). Igual que
+    /// presionar F; F/Esc la devuelven a ventana normal.
     #[arg(long = "borderless", default_value_t = false)]
     borderless: bool,
 

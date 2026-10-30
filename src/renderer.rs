@@ -135,7 +135,9 @@ impl RendererApp {
     fn set_borderless(&mut self, ctx: &egui::Context, on: bool) {
         if on != self.borderless {
             self.borderless = on;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+            // borderless = ventana SIN decoraciones (sin barra de título),
+            // NO fullscreen nativo: la ventana conserva tamaño y posición
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!on));
         }
     }
 
@@ -305,7 +307,7 @@ pub fn run(
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
-            .with_fullscreen(borderless)
+            .with_decorations(!borderless)
             .with_title("ScalApp AV Monitor - Direct Output"),
         ..Default::default()
     };
