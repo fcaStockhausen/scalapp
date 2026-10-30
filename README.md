@@ -49,6 +49,9 @@ scalapp
 scalapp --block-size 128   # ~4ms
 scalapp --block-size 512   # ~13ms
 
+# Arrancar directo en fullscreen (volumen default 20%)
+scalapp --video --borderless
+
 # Ultra-low latency (8ms, sin passthrough directo)
 scalapp --ultra-low-latency
 

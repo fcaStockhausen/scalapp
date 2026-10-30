@@ -622,7 +622,7 @@ impl AudioCapture {
             total_played: AtomicU64::new(0),
             start_time: Mutex::new(None),
             playback: Arc::new(Mutex::new(None)),
-            volume: Mutex::new(0.5),
+            volume: Mutex::new(0.2),
             cushion_base_ms: AtomicU64::new(0),
             notch_hum: std::sync::atomic::AtomicBool::new(false),
             hpf_hz: AtomicU32::new(0),
@@ -827,7 +827,7 @@ impl AudioCapture {
         if self.enable_playback {
             let playback = Arc::new(AudioPlayback::new(self.channels, self.low_latency_mode));
             let volume = *self.volume.lock().unwrap();
-            playback.set_volume(volume);
+            playback.set_volume(scale_volume(volume));
             // bloque de salida pequeño también: aporta un bloque de latencia
             let out_bs = self.block_size.min(512);
             match playback.start(

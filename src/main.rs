@@ -61,9 +61,9 @@ fn parse_volume_cmd(raw: &str) -> Option<VolumeCmd> {
 }
 
 fn volume_console_loop<T: VolumeTarget>(target: &mut T, mut streams: Option<&mut passthrough::PassthroughStreams>) {
-    let mut current_volume = 0.3f32;
+    let mut current_volume = 0.2f32;
     let mut is_muted = false;
-    let mut muted_volume = 0.3f32;
+    let mut muted_volume = 0.2f32;
     target.set_volume(current_volume);
     println!("✓ Volume set to {}%", (current_volume * 100.0) as i32);
     println!("Volume: {}% {} | Command (v/V/m/q/0-9): ",
@@ -201,6 +201,11 @@ struct Args {
     /// −9dB, A1/55Hz −4dB, B1/62Hz −3dB) — decisión del usuario.
     #[arg(long = "hpf", default_value_t = 0)]
     hpf: u32,
+
+    /// Iniciar directamente en modo borderless/fullscreen (equivale a
+    /// presionar F al abrir; Esc vuelve a ventana).
+    #[arg(long = "borderless", default_value_t = false)]
+    borderless: bool,
 
     #[arg(long)]
     ultra_low_latency: bool,
@@ -468,6 +473,7 @@ fn run(args: Args) -> Result<()> {
             sync_controller.clone(),
             Arc::clone(video),
             Some(audio_streams.clone()),
+            args.borderless,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))
     };
@@ -518,7 +524,7 @@ fn run_direct_passthrough(audio_device_index: Option<usize>, block_size_arg: Opt
     println!("  Expected total latency: ~{:.1}ms (including OS overhead)", block_ms + 1.0);
     println!("{}\n", "=".repeat(50));
 
-    let passthrough = PassthroughWithVolume::new(44100, 2, block_size, 0.3)
+    let passthrough = PassthroughWithVolume::new(44100, 2, block_size, 0.2)
         .with_cushion(delay_ms, stall_ms)
         .with_virtual_out(virtual_out)
         .with_notch_hum(notch_hum)

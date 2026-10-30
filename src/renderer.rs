@@ -62,6 +62,7 @@ impl RendererApp {
         sync: Arc<SyncController>,
         video: Arc<VideoCapture>,
         audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
+        borderless: bool,
     ) -> Self {
         let texture = cc.egui_ctx.load_texture(
             "video",
@@ -77,8 +78,8 @@ impl RendererApp {
             texture_size: [1, 1],
             show_overlay: false,
             show_stats: false,
-            volume_pct: 50.0,
-            borderless: false,
+            volume_pct: 20.0,
+            borderless,
             status_text: "Initializing...".into(),
             audio_streams,
             painted_fps: FpsMeter::new(),
@@ -299,10 +300,12 @@ pub fn run(
     sync: Arc<SyncController>,
     video: Arc<VideoCapture>,
     audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
+    borderless: bool,
 ) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
+            .with_fullscreen(borderless)
             .with_title("ScalApp AV Monitor - Direct Output"),
         ..Default::default()
     };
@@ -315,6 +318,7 @@ pub fn run(
                 sync,
                 video,
                 audio_streams,
+                borderless,
             )))
         }),
     )
