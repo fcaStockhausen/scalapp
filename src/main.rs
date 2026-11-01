@@ -357,8 +357,14 @@ fn run(args: Args) -> Result<()> {
                         CameraIndex::String(c.unique_id.clone())
                     }
                     None => {
-                        println!("Using fallback video device index: 1");
-                        CameraIndex::Index(1)
+                        // ANTES: fallback a ciegas al índice 1 — llegó a
+                        // entregar la FaceTime a 30fps cuando Discord tenía
+                        // tomada la capturadora. Mejor fallar con diagnóstico.
+                        bail!(
+                            "no se pudo abrir ninguna capturadora HDMI de video.\n\
+                             \x20 Si Discord/OBS está corriendo, puede tener el device tomado \
+                             (Lock Rejected en el log) — cerralo o quitale la cámara y reintentá."
+                        );
                     }
                 }
             }

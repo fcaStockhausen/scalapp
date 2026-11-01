@@ -11,21 +11,44 @@ use nokhwa::{query, Camera};
 /// panic). El binding macOS de nokhwa puede lanzar en set_all cuando el
 /// modo pedido no calza con la lista del device (visto: MS2131 en USB2,
 /// donde no existe YUYV 1080p60) — eso debe ser un intento fallido, no
-/// un crash de la app.
-pub fn try_camera_new(
+/// un crash de la app. Con reintentos ante "Lock Rejected": otro proceso
+/// (Discord) puede tener el device un instante.
+pub fn try_camera_new(index: CameraIndex, requested: RequestedFormat) -> Result<Camera, String> {
+    try_camera_new_retry(index, requested, 0)
+}
+
+/// Ídem con hasta `retries` reintentos (1.5s entre cada uno) cuando el
+/// device está tomado ("Lock Rejected" / "Already in use").
+pub fn try_camera_new_retry(
     index: CameraIndex,
     requested: RequestedFormat,
+    retries: u32,
 ) -> Result<Camera, String> {
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Camera::new(index, requested)
-    }));
-    std::panic::set_hook(prev_hook);
-    match result {
-        Ok(Ok(camera)) => Ok(camera),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("excepción NSException del binding al setear el formato".into()),
+    let mut attempt = 0;
+    loop {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Camera::new(index.clone(), requested)
+        }));
+        std::panic::set_hook(prev_hook);
+        match result {
+            Ok(Ok(camera)) => return Ok(camera),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                let busy = msg.contains("Lock Rejected") || msg.contains("Already in use");
+                if busy && attempt < retries {
+                    attempt += 1;
+                    println!("[camera] device tomado (¿Discord?) — reintento {attempt}/{retries} en 1.5s");
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    continue;
+                }
+                return Err(msg);
+            }
+            Err(_) => {
+                return Err("excepción NSException del binding al setear el formato".into())
+            }
+        }
     }
 }
 
@@ -157,9 +180,10 @@ pub fn probe_camera_by_id(unique_id: &str) -> Option<(u32, u32, f32, String)> {
         mode.frame_rate(),
         mode.format()
     );
-    let camera = match try_camera_new(
+    let camera = match try_camera_new_retry(
         CameraIndex::String(unique_id.to_string()),
         RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(mode)),
+        3,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -291,7 +315,7 @@ fn is_capture_device_name(name_lower: &str) -> bool {
         .any(|k| name_lower.contains(k))
 }
 
-fn is_excluded_device_name(name_lower: &str) -> bool {
+pub fn is_excluded_device_name(name_lower: &str) -> bool {
     ["iphone", "facetime", "built-in", "webcam", "camera",
         "isight", "macbook", "imac", "obs virtual"]
         .iter()

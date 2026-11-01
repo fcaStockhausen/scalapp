@@ -253,9 +253,10 @@ impl VideoCapture {
                         mode.format()
                     );
                 }
-                if let Ok(camera) = devices::try_camera_new(
+                if let Ok(camera) = devices::try_camera_new_retry(
                     self.device.clone(),
                     RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(mode)),
+                    3,
                 ) {
                     return Ok(camera);
                 }
@@ -280,9 +281,16 @@ impl VideoCapture {
                     if idx == primary {
                         continue;
                     }
-                    match devices::try_camera_new(CameraIndex::Index(idx), exact) {
+                    match devices::try_camera_new_retry(CameraIndex::Index(idx), exact, 0) {
                         Ok(camera) => {
-                            println!("Exact format negotiated at alternate index {idx}");
+                            // NUNCA caer a una webcam (el fallback a ciegas
+                            // llegó a mostrar la FaceTime a 30fps)
+                            let name = camera.info().human_name().to_lowercase();
+                            if devices::is_excluded_device_name(&name) {
+                                println!("índice {idx} = {} (webcam) — ignorado", camera.info().human_name());
+                                continue;
+                            }
+                            println!("Exact format negotiated at alternate index {idx} ({})", camera.info().human_name());
                             return Ok(camera);
                         }
                         Err(_) => continue,

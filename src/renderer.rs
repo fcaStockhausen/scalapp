@@ -512,7 +512,13 @@ impl eframe::App for RendererApp {
         );
         self.update_status();
         // Fase 1: 8ms mientras llega el repaint dirigido por frames (Fase 2)
-        ctx.request_repaint_after(Duration::from_millis(8));
+        // heartbeat de repaint: base cuando no llegan frames. El arrival
+        // notifier (Fase 2-lite) agrega repaints al llegar cada frame.
+        let hb = std::env::var("SCALAPP_HEARTBEAT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8);
+        ctx.request_repaint_after(Duration::from_millis(hb));
     }
 }
 
