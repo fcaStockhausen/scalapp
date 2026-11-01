@@ -308,107 +308,124 @@ pub fn best_mode_for_device(uid: &str, want: (u32, u32, u32)) -> Option<CameraFo
     last_by_dims.first().copied()
 }
 
-fn is_capture_device_name(name_lower: &str) -> bool {
-    ["hdmi", "capture", "usb", "elgato", "magewell", "blackmagic",
-        "avermedia", "hdmic", "video", "usb-video", "composite", "component"]
-        .iter()
-        .any(|k| name_lower.contains(k))
+/// Clasificación de dispositivos de video: la heurística anti-webcam.
+/// Nunca abrir nada que no sea clase Capture (o Unknown como fallback
+/// de capturadoras con nombre exótico) — Virtual/Webcam vetados en
+/// TODOS los caminos de selección.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeviceClass {
+    /// Capturadora HDMI (o candidata por nombre)
+    Capture,
+    /// Webcam (FaceTime, integradas, iPhone) — VETADA
+    Webcam,
+    /// Cámara virtual (OBS, droidcam...) — VETADA
+    Virtual,
+    /// Nombre no reconocido — se prueba como fallback con filtro ≥720p
+    Unknown,
 }
 
-pub fn is_excluded_device_name(name_lower: &str) -> bool {
-    ["iphone", "facetime", "built-in", "webcam", "camera",
-        "isight", "macbook", "imac", "obs virtual"]
-        .iter()
-        .any(|e| name_lower.contains(e))
+pub fn classify_device_name(name_lower: &str) -> DeviceClass {
+    // normalizar acentos (cámara/camara)
+    let n: String = name_lower
+        .chars()
+        .map(|c| match c {
+            'á' => 'a', 'é' => 'e', 'í' => 'i', 'ó' => 'o', 'ú' => 'u',
+            other => other,
+        })
+        .collect();
+    // el orden importa: virtual antes que webcam ("OBS Virtual Camera"),
+    // webcam antes que capture ("USB Camera" = webcam, exclusión gana)
+    let virtual_kw = ["obs virtual", "virtual", "droidcam", "epoccam", "iriun", "snap camera"];
+    let webcam_kw = ["facetime", "isight", "built-in", "builtin", "webcam", "camera",
+                     "camara", "iphone", "ipad", "macbook", "imac", "continuity"];
+    let capture_kw = ["hdmi", "capture", "usb", "elgato", "magewell", "blackmagic",
+                      "avermedia", "hdmic", "video", "usb-video", "composite", "component"];
+    if virtual_kw.iter().any(|k| n.contains(k)) {
+        return DeviceClass::Virtual;
+    }
+    if webcam_kw.iter().any(|k| n.contains(k)) {
+        return DeviceClass::Webcam;
+    }
+    if capture_kw.iter().any(|k| n.contains(k)) {
+        return DeviceClass::Capture;
+    }
+    DeviceClass::Unknown
+}
+
+/// Entrada del mapa de dispositivos de video (una enumeración, todo
+/// clasificado — la base de TODA decisión de apertura).
+pub struct VideoDeviceEntry {
+    pub index: u32,
+    pub uid: String,
+    pub name: String,
+    pub class: DeviceClass,
+}
+
+/// Enumera y clasifica todos los dispositivos de video visibles.
+pub fn video_device_map() -> Vec<VideoDeviceEntry> {
+    query_devices_full()
+        .into_iter()
+        .map(|(index, name, unique_id)| VideoDeviceEntry {
+            index,
+            uid: unique_id,
+            class: classify_device_name(&name.to_lowercase()),
+            name,
+        })
+        .collect()
+}
+
+/// Imprime el mapa con la clasificación — visible siempre en el arranque
+/// para que la decisión de selección sea auditable.
+pub fn print_video_device_map() {
+    println!("Mapa de dispositivos de video:");
+    for e in video_device_map() {
+        let tag = match e.class {
+            DeviceClass::Capture => "capturadora",
+            DeviceClass::Webcam => "WEBCAM (vetada)",
+            DeviceClass::Virtual => "virtual (vetada)",
+            DeviceClass::Unknown => "desconocida (fallback)",
+        };
+        println!("  [{}] {} — {}", e.index, e.name, tag);
+    }
 }
 
 pub fn auto_detect_video() -> Vec<VideoCandidate> {
-    println!("Buscando capturadoras USB HDMI (incluyendo genéricas)...");
-
+    println!("Buscando capturadoras USB HDMI...");
+    let map = video_device_map();
     let mut candidates: Vec<VideoCandidate> = Vec::new();
 
-    if cfg!(target_os = "macos") {
-        // 1) Fuente primaria: query() del mismo backend que usará la
-        //    captura. Identidad por uniqueID, no por posición.
-        for (index, name, unique_id) in query_devices_full() {
-            let name_lower = name.to_lowercase();
-            if !is_capture_device_name(&name_lower) || is_excluded_device_name(&name_lower) {
-                continue;
-            }
-            if let Some((w, h, fps, _dev_name)) = probe_camera_by_id(&unique_id) {
-                // la identidad ya la dio el nombre; aceptar el mejor modo
-                // que el device entregue (en USB2 no hay ≥720p usable)
-                if w > 0 && h > 0 {
-                    let device_name = format!("{name} {w}x{h}@{fps:.0}fps");
-                    println!("  -> Encontrado: {device_name} (ID: {index})");
-                    candidates.push(VideoCandidate {
-                        id: index,
-                        unique_id,
-                        name: device_name,
-                        width: w,
-                        height: h,
-                        fps,
-                    });
-                }
-            }
-        }
-
-        // 2) Fallback: nombres de system_profiler + sondeo posicional
-        if candidates.is_empty() {
-            for name in system_profiler_camera_names() {
-                let name_lower = name.to_lowercase();
-                if !is_capture_device_name(&name_lower) || is_excluded_device_name(&name_lower) {
-                    continue;
-                }
-                for i in 0..4u32 {
-                    if let Some((w, h, fps, dev_name)) = probe_camera_by_index(i) {
-                        let dev_lower = dev_name.to_lowercase();
-                        if w >= 1280
-                            && h >= 720
-                            && (dev_lower.contains(&name_lower) || name_lower.contains(&dev_lower))
-                            && !candidates.iter().any(|c| c.id == i)
-                        {
-                            let device_name = format!("{name} {w}x{h}@{fps:.0}fps");
-                            println!("  -> Encontrado: {device_name} (ID: {i})");
-                            candidates.push(VideoCandidate {
-                                id: i,
-                                unique_id: format!("idx:{i}"),
-                                name: device_name,
-                                width: w,
-                                height: h,
-                                fps,
-                            });
-                            break;
-                        }
-                    }
-                }
+    // 1) Solo clase Capture (heurística anti-webcam: Virtual/Webcam ni
+    //    se prueban — nunca más se les enciende la luz por accidente)
+    for e in map.iter().filter(|e| e.class == DeviceClass::Capture) {
+        if let Some((w, h, fps, _)) = probe_camera_by_id(&e.uid) {
+            if w > 0 && h > 0 {
+                let device_name = format!("{} {w}x{h}@{fps:.0}fps", e.name);
+                println!("  -> Encontrado: {device_name} (ID: {})", e.index);
+                candidates.push(VideoCandidate {
+                    id: e.index,
+                    unique_id: e.uid.clone(),
+                    name: device_name,
+                    width: w,
+                    height: h,
+                    fps,
+                });
             }
         }
     }
 
-    // 3) Fallback genérico: cualquier dispositivo con resolución HDMI.
-    //    Filtrar por NOMBRE antes de abrir (query no enciende la cámara:
-    //    abrir la FaceTime para excluirla prende su luz).
+    // 2) Fallback: dispositivos de clase Unknown (capturadoras con
+    //    nombre exótico), con filtro de resolución HDMI
     if candidates.is_empty() {
-        println!("Buscando por capacidades (dispositivos con resolución HDMI)...");
-        for (index, name, unique_id) in query_devices_full() {
-            let name_lower = name.to_lowercase();
-            if is_excluded_device_name(&name_lower) {
-                continue;
-            }
-            if let Some((w, h, fps, dev_name)) = probe_camera_by_id(&unique_id) {
-                let dev_lower = dev_name.to_lowercase();
-                if w >= 1280
-                    && h >= 720
-                    && !(w == 1280 && h == 720 && fps < 31.0)
-                    && !is_excluded_device_name(&dev_lower)
-                {
-                    let device_name = format!("Capturadora_Generica_{index} {w}x{h}@{fps:.0}fps");
-                    println!("  -> Encontrado: {device_name} (ID: {index})");
+        println!("Sin capturadoras por nombre — probando dispositivos desconocidos...");
+        for e in map.iter().filter(|e| e.class == DeviceClass::Unknown) {
+            if let Some((w, h, fps, _)) = probe_camera_by_id(&e.uid) {
+                if w >= 1280 && h >= 720 && !(w == 1280 && h == 720 && fps < 31.0) {
+                    let device_name = format!("Capturadora_Generica_{} {w}x{h}@{fps:.0}fps", e.index);
+                    println!("  -> Encontrado: {device_name} (ID: {})", e.index);
                     candidates.push(VideoCandidate {
-                        id: index,
-                        unique_id,
-                        name: format!("{device_name} ({dev_name})"),
+                        id: e.index,
+                        unique_id: e.uid.clone(),
+                        name: device_name,
                         width: w,
                         height: h,
                         fps,
@@ -430,6 +447,7 @@ pub fn auto_detect_video() -> Vec<VideoCandidate> {
 pub fn list_devices() {
     println!("Dispositivos HDMI USB Captura SOLAMENTE:");
     println!("{}", "=".repeat(50));
+    print_video_device_map();
 
     println!("\nDispositivos de Audio HDMI USB:");
     let candidates = auto_detect_audio();

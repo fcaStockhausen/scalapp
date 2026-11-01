@@ -218,6 +218,12 @@ struct Args {
     #[arg(long = "borderless", default_value_t = false)]
     borderless: bool,
 
+    /// Escapa la veda anti-webcam: permite abrir un dispositivo
+    /// clasificado como webcam/virtual (para capturadoras con nombre que
+    /// dispara la heurística). Requiere --video-device.
+    #[arg(long = "force-webcam", default_value_t = false)]
+    force_webcam: bool,
+
     #[arg(long)]
     ultra_low_latency: bool,
 
@@ -341,11 +347,44 @@ fn run(args: Args) -> Result<()> {
     );
 
     let video_capture = if !audio_only {
+        // Mapa clasificado visible siempre: la decisión de selección es
+        // auditable (y la veda anti-webcam tiene su base).
+        devices::print_video_device_map();
         // Identidad del dispositivo: uniqueID del autodetect (determinista;
         // el orden de índices de AVFoundation baila entre sesiones) o el
         // índice explícito del usuario.
         let device = match args.video_device {
-            Some(id) => CameraIndex::Index(id as u32),
+            Some(id) => {
+                let map = devices::video_device_map();
+                let entry = map.iter().find(|e| e.index == id as u32);
+                match entry {
+                    Some(e) => {
+                        if e.class == devices::DeviceClass::Webcam
+                            || e.class == devices::DeviceClass::Virtual
+                        {
+                            if args.force_webcam {
+                                println!(
+                                    "⚠ --force-webcam: abriendo '{}' ({:?}) igual",
+                                    e.name, e.class
+                                );
+                            } else {
+                                bail!(
+                                    "el dispositivo [{}] '{}' está clasificado como {:?} — \
+                                     veda anti-webcam.\n  Mirá el mapa de arriba y elegí una \
+                                     capturadora, o usá --force-webcam si estás seguro.",
+                                    e.index,
+                                    e.name,
+                                    e.class
+                                );
+                            }
+                        }
+                        CameraIndex::Index(id as u32)
+                    }
+                    None => {
+                        bail!("no hay dispositivo de video en el índice {id} (mirá el mapa de arriba)")
+                    }
+                }
+            }
             None => {
                 let candidates = devices::auto_detect_video();
                 match candidates.first() {
@@ -377,6 +416,7 @@ fn run(args: Args) -> Result<()> {
         );
         // si el usuario fijó --video-device N, respetarlo (sin escaneo)
         capture.set_allow_index_scan(args.video_device.is_none());
+        capture.allow_webcam = args.force_webcam;
         let capture = Arc::new(capture);
         println!(
             "✓ Video capture initialized: {}x{} @ {}fps",

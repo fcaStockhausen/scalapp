@@ -157,6 +157,9 @@ pub struct VideoCapture {
     /// el repaint EXACTO cuando hay algo nuevo que pintar (adiós a
     /// perder frames por ráfagas entre repaints por timer).
     frame_notifier: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
+    /// Escapa la veda de webcams (--force-webcam) para casos exóticos
+    /// (capturadora con nombre que dispara la heurística).
+    pub allow_webcam: bool,
     /// Single-slot latest-wins: el consumidor toma SIEMPRE el último frame,
     /// la latencia de cola es 0 por construcción.
     latest: Arc<Mutex<Option<Arc<TimestampedFrame>>>>,
@@ -181,6 +184,7 @@ impl VideoCapture {
             allow_index_scan: true,
             frame_notifier: Arc::new(Mutex::new(None)),
             color_adjust: Arc::new(Mutex::new((1.0, 1.0))),
+            allow_webcam: false,
             latest: Arc::new(Mutex::new(None)),
             frame_seq: Arc::new(AtomicU64::new(0)),
             displayed: Arc::new(AtomicU64::new(0)),
@@ -245,6 +249,34 @@ impl VideoCapture {
     ///    Exact → escaneo → Closest YUYV → Closest MJPEG, todo bajo
     ///    catch_unwind.
     fn open_camera(&self) -> Result<Camera, String> {
+        // VEDA DE WEBCAMS: clasificar el dispositivo objetivo ANTES de
+        // abrirlo. Ningún camino de selección puede terminar en una
+        // webcam/virtual (el bug histórico: fallback a ciegas → FaceTime
+        // a 30fps mostrada como si fuera la capturadora).
+        let uid: Option<String> = match &self.device {
+            CameraIndex::String(s) => Some(s.clone()),
+            CameraIndex::Index(i) => nokhwa_bindings_macos::query_avfoundation()
+                .ok()
+                .and_then(|v| v.into_iter().nth(*i as usize))
+                .map(|info| info.misc().to_string()),
+        };
+        if let (Some(uid), false) = (&uid, self.allow_webcam) {
+            if let Some(entry) = devices::video_device_map()
+                .into_iter()
+                .find(|e| &e.uid == uid)
+            {
+                match entry.class {
+                    devices::DeviceClass::Webcam | devices::DeviceClass::Virtual => {
+                        return Err(format!(
+                            "'{}' está clasificada como {:?} — veda anti-webcam \
+                             (usá el mapa del arranque para elegir, o --force-webcam)",
+                            entry.name, entry.class
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
         let uid: Option<String> = match &self.device {
             CameraIndex::String(s) => Some(s.clone()),
             CameraIndex::Index(i) => nokhwa_bindings_macos::query_avfoundation()
@@ -309,11 +341,13 @@ impl VideoCapture {
                     }
                     match devices::try_camera_new_retry(CameraIndex::Index(idx), exact, 0) {
                         Ok(camera) => {
-                            // NUNCA caer a una webcam (el fallback a ciegas
-                            // llegó a mostrar la FaceTime a 30fps)
+                            // NUNCA caer a una webcam (clasificación del
+                            // mapa: Virtual/Webcam vetadas)
                             let name = camera.info().human_name().to_lowercase();
-                            if devices::is_excluded_device_name(&name) {
-                                println!("índice {idx} = {} (webcam) — ignorado", camera.info().human_name());
+                            if matches!(
+                                devices::classify_device_name(&name),
+                                devices::DeviceClass::Webcam | devices::DeviceClass::Virtual
+                            ) {
                                 continue;
                             }
                             println!("Exact format negotiated at alternate index {idx} ({})", camera.info().human_name());
