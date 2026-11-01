@@ -99,6 +99,20 @@ impl StatsInner {
     }
 }
 
+/// Transforma un buffer RGB24 in-place: gain de R + mezcla hacia luma
+/// (saturación). Corre en el thread de captura — fuera del loop de UI.
+fn apply_color_adjust(buf: &mut [u8], rg: f32, sat: f32) {
+    for px in buf.as_chunks_mut::<3>().0.iter_mut() {
+        let r = px[0] as f32 * rg;
+        let g = px[1] as f32;
+        let b = px[2] as f32;
+        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        px[0] = (luma + (r - luma) * sat).clamp(0.0, 255.0) as u8;
+        px[1] = (luma + (g - luma) * sat).clamp(0.0, 255.0) as u8;
+        px[2] = (luma + (b - luma) * sat).clamp(0.0, 255.0) as u8;
+    }
+}
+
 /// Almacena `frame` en el slot latest-wins. Si el frame reemplazado nunca
 /// fue mostrado por el renderer (`displayed` quedó atrás), cuenta como skip.
 fn store_frame(
@@ -133,6 +147,11 @@ pub struct VideoCapture {
     /// formato exacto se escaldean otros. Un dispositivo sin el modo
     /// pedido falla el open en vez de mostrar la cámara equivocada.
     allow_index_scan: bool,
+    /// Ajuste de color aplicado EN EL THREAD DE CAPTURA (post-decode),
+    /// no en el loop de render: 2M píxeles de float por frame no deben
+    /// pisar el presupuesto del hilo de UI (judder). Calibrado por el
+    /// usuario contra el monitor físico; persiste en ~/.scalapp_color.
+    color_adjust: Arc<Mutex<(f32, f32)>>,
     /// Notificador de frame nuevo (Fase 2-lite): el thread de captura lo
     /// llama al almacenar cada frame — el renderer lo usa para disparar
     /// el repaint EXACTO cuando hay algo nuevo que pintar (adiós a
@@ -161,6 +180,7 @@ impl VideoCapture {
             fps,
             allow_index_scan: true,
             frame_notifier: Arc::new(Mutex::new(None)),
+            color_adjust: Arc::new(Mutex::new((1.0, 1.0))),
             latest: Arc::new(Mutex::new(None)),
             frame_seq: Arc::new(AtomicU64::new(0)),
             displayed: Arc::new(AtomicU64::new(0)),
@@ -174,6 +194,12 @@ impl VideoCapture {
     /// Registra el callback de "frame nuevo" (lo llama el thread de
     /// captura por frame almacenado). El renderer instala
     /// `ctx.request_repaint()` para pintar exactamente cuando llega.
+    /// Ajuste de color (gain de R, saturación) aplicado en el thread de
+    /// captura — lo alimenta el renderer desde los sliders.
+    pub fn set_color_adjust(&self, red_gain: f32, saturation: f32) {
+        *self.color_adjust.lock().unwrap() = (red_gain, saturation);
+    }
+
     pub fn set_frame_notifier(&self, cb: Option<Box<dyn Fn() + Send>>) {
         *self.frame_notifier.lock().unwrap() = cb;
     }
@@ -370,9 +396,16 @@ impl VideoCapture {
                     Ok(image) => {
                         let width = image.width();
                         let height = image.height();
+                        let mut raw = image.into_raw();
+                        // ajuste de color AQUÍ (thread de captura, no el de
+                        // UI): por-píxel gain de R + mezcla a luma
+                        let (rg, sat) = *self.color_adjust.lock().unwrap();
+                        if (rg - 1.0).abs() > 1e-3 || (sat - 1.0).abs() > 1e-3 {
+                            apply_color_adjust(&mut raw, rg, sat);
+                        }
                         let timestamp = start_time.elapsed().as_secs_f64();
                         let frame = TimestampedFrame {
-                            data: Arc::new(image.into_raw()),
+                            data: Arc::new(raw),
                             width,
                             height,
                             timestamp,

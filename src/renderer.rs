@@ -64,6 +64,10 @@ impl VideoHealth {
         }
     }
 
+    fn due(&self) -> bool {
+        self.last.elapsed().as_secs() >= 15
+    }
+
     fn maybe_report(
         &mut self,
         cap_fps: f32,
@@ -162,8 +166,7 @@ impl RendererApp {
         let mut app = Self {
             sync,
             video,
-            texture,
-            last_frame_number: u64::MAX,
+            texture,            last_frame_number: u64::MAX,
             last_paint: None,
             paint_bursts: 0,
             paint_gaps: 0,
@@ -185,6 +188,9 @@ impl RendererApp {
             saturation: 1.0,
         };
         app.load_color_adjust();
+        // empujar el ajuste cargado al thread de captura (ahí se aplica)
+        app.video
+            .set_color_adjust(app.red_gain, app.saturation);
         app
     }
 
@@ -253,30 +259,15 @@ impl RendererApp {
         if frame.data.len() < expected_src {
             return;
         }
-        // RGB → RGBA en buffer reutilizado (el alpha queda fijado en 255)
+        // RGB → RGBA en buffer reutilizado (el alpha queda fijado en 255).
+        // El ajuste de color corre en el THREAD DE CAPTURA (ver
+        // VideoCapture::set_color_adjust) — este loop queda liviano.
         self.rgba.resize(w * h * 4, 255);
-        let rg = self.red_gain;
-        let sat = self.saturation;
-        let neutral = (rg - 1.0).abs() < 1e-3 && (sat - 1.0).abs() < 1e-3;
         let src_pixels = frame.data.as_chunks::<3>().0;
-        if neutral {
-            for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
-                dst[0] = src[0];
-                dst[1] = src[1];
-                dst[2] = src[2];
-            }
-        } else {
-            // ajuste de color por ojo: gain de R + mezcla hacia luma
-            // (saturación) — calibrado contra el monitor físico
-            for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
-                let r = src[0] as f32 * rg;
-                let g = src[1] as f32;
-                let b = src[2] as f32;
-                let luma = 0.299 * r + 0.587 * g + 0.114 * b;
-                dst[0] = (luma + (r - luma) * sat).clamp(0.0, 255.0) as u8;
-                dst[1] = (luma + (g - luma) * sat).clamp(0.0, 255.0) as u8;
-                dst[2] = (luma + (b - luma) * sat).clamp(0.0, 255.0) as u8;
-            }
+        for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
         }
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.rgba);
         self.texture.set(image, egui::TextureOptions::LINEAR);
@@ -436,17 +427,20 @@ impl eframe::App for RendererApp {
                         .add(egui::Slider::new(&mut self.red_gain, 0.5..=1.5).text("Rojo"))
                         .changed()
                     {
+                        self.video.set_color_adjust(self.red_gain, self.saturation);
                         self.save_color_adjust();
                     }
                     if ui
                         .add(egui::Slider::new(&mut self.saturation, 0.0..=1.5).text("Saturación"))
                         .changed()
                     {
+                        self.video.set_color_adjust(self.red_gain, self.saturation);
                         self.save_color_adjust();
                     }
                     if ui.button("↺").clicked() {
                         self.red_gain = 1.0;
                         self.saturation = 1.0;
+                        self.video.set_color_adjust(1.0, 1.0);
                         self.save_color_adjust();
                     }
                     let borderless_label = if self.borderless {
@@ -491,25 +485,29 @@ impl eframe::App for RendererApp {
         }
 
         self.pull_frame();
-        let cap_stats = self.video.get_capture_stats();
-        let mut paint_deltas = std::mem::take(&mut self.paint_deltas_ms);
-        let mut paint_pct = |p: usize| -> f32 {
-            if paint_deltas.is_empty() {
-                return 0.0;
-            }
-            paint_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            paint_deltas[(paint_deltas.len() - 1) * p / 100]
-        };
-        self.health.maybe_report(
-            cap_stats.fps_actual,
-            self.painted_fps.fps,
-            self.loop_fps.fps,
-            cap_stats.skipped_frames,
-            (cap_stats.pacing_bursts, cap_stats.pacing_gaps, cap_stats.pacing_p50_ms),
-            (self.paint_bursts, self.paint_gaps, paint_pct(50)),
-            (paint_pct(10), paint_pct(90)),
-            self.video.fps,
-        );
+        if self.health.due() {
+            // tomar los deltas SOLO al reportar (antes se drenaban por
+            // update y el p50 salía de 1-2 muestras = artefacto)
+            let mut paint_deltas = std::mem::take(&mut self.paint_deltas_ms);
+            let mut paint_pct = |p: usize| -> f32 {
+                if paint_deltas.is_empty() {
+                    return 0.0;
+                }
+                paint_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                paint_deltas[(paint_deltas.len() - 1) * p / 100]
+            };
+            let cap_stats = self.video.get_capture_stats();
+            self.health.maybe_report(
+                cap_stats.fps_actual,
+                self.painted_fps.fps,
+                self.loop_fps.fps,
+                cap_stats.skipped_frames,
+                (cap_stats.pacing_bursts, cap_stats.pacing_gaps, cap_stats.pacing_p50_ms),
+                (self.paint_bursts, self.paint_gaps, paint_pct(50)),
+                (paint_pct(10), paint_pct(90)),
+                self.video.fps,
+            );
+        }
         self.update_status();
         // Fase 1: 8ms mientras llega el repaint dirigido por frames (Fase 2)
         // heartbeat de repaint: base cuando no llegan frames. El arrival
