@@ -29,12 +29,104 @@ pub struct CaptureStats {
     /// frame más nuevo.
     pub skipped_frames: u64,
     pub last_frame_time: Option<f64>,
-    /// Diagnóstico de PACING (judder): distribución de los deltas de
-    /// llegada en la ventana actual. fps promedio 60 con deltas
-    /// desparejos = video que se ve a 30-40 aunque el contador diga 60.
-    pub pacing_bursts: u64,
-    pub pacing_gaps: u64,
-    pub pacing_p50_ms: f32,
+    /// Pacing del DEVICE (capture_timestamp de AVFoundation = reloj de la
+    /// señal): la llegada REAL. fps promedio 60 con deltas desparejos
+    /// = judder aunque el contador diga 60.
+    pub device_bursts: u64,
+    pub device_gaps: u64,
+    pub device_p50_ms: f32,
+    /// Pacing del PULL-LOOP (nuestro ritmo de consumo): si difiere del
+    /// device, la ráfaga la genera AVFoundation/nokhwa al entregarnos
+    /// los buffers — no la señal.
+    pub pull_bursts: u64,
+    pub pull_gaps: u64,
+    pub pull_p50_ms: f32,
+}
+
+/// Pacing medido en un reloj cualquiera (deltas entre eventos).
+/// La clave del diagnóstico de judder: el pacing DEL DEVICE (su
+/// capture_timestamp, reloj de la señal) puede diferir del pacing del
+/// pull-loop (nuestro ritmo de consumo) — medir solo el último es
+/// medir "los hertz de salida de la aplicación", no los de entrada.
+struct PacingStats {
+    last: Option<f64>,
+    bursts: u64,
+    gaps: u64,
+    deltas: Vec<f32>,
+}
+
+impl PacingStats {
+    fn new() -> Self {
+        Self {
+            last: None,
+            bursts: 0,
+            gaps: 0,
+            deltas: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, t: f64) {
+        if let Some(prev) = self.last.replace(t) {
+            let delta_ms = ((t - prev) * 1000.0) as f32;
+            if delta_ms < 8.0 {
+                self.bursts += 1;
+            }
+            if delta_ms > 25.0 {
+                self.gaps += 1;
+            }
+            self.deltas.push(delta_ms);
+            let max = 15 * 120;
+            if self.deltas.len() > max {
+                let drop = self.deltas.len() - max;
+                self.deltas.drain(..drop);
+            }
+        }
+    }
+
+    fn p50_ms(&self) -> f32 {
+        if self.deltas.is_empty() {
+            return 0.0;
+        }
+        let mut v = self.deltas.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    }
+}
+
+/// Trace de eventos con timestamp (SCALAPP_TRACE=<path>): stores del
+/// capturador (con reloj device Y pull) y paints del renderer — la
+/// línea de tiempo completa para análisis post-morten de pacing.
+pub struct Trace {
+    file: Option<std::fs::File>,
+    t0: Instant,
+}
+
+impl Trace {
+    fn from_env() -> Self {
+        let file = std::env::var("SCALAPP_TRACE").ok().map(|path| {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("SCALAPP_TRACE {path}: {e}"));
+            println!("[trace] eventos a {path}");
+            f
+        });
+        Self {
+            file,
+            t0: Instant::now(),
+        }
+    }
+
+    #[inline]
+    fn log(&mut self, event: &str, detail: &str) {
+        if let Some(f) = &mut self.file {
+            use std::io::Write;
+            let t = self.t0.elapsed().as_secs_f64() * 1000.0;
+            let _ = writeln!(f, "{t:.3}\t{event}\t{detail}");
+        }
+    }
 }
 
 struct StatsInner {
@@ -44,11 +136,10 @@ struct StatsInner {
     fps_frame_count: u64,
     last_fps_time: Instant,
     last_frame_time: Option<f64>,
-    // pacing: deltas de llegada (ventana móvil)
-    pacing_last: Option<f64>,
-    pacing_bursts: u64,
-    pacing_gaps: u64,
-    pacing_deltas_ms: Vec<f32>,
+    // pacing del DEVICE (capture_timestamp de AVFoundation = reloj de la
+    // señal) vs pacing del PULL-LOOP (nuestro consumo)
+    device_pacing: PacingStats,
+    pull_pacing: PacingStats,
 }
 
 impl StatsInner {
@@ -60,42 +151,9 @@ impl StatsInner {
             fps_frame_count: 0,
             last_fps_time: Instant::now(),
             last_frame_time: None,
-            pacing_last: None,
-            pacing_bursts: 0,
-            pacing_gaps: 0,
-            pacing_deltas_ms: Vec::new(),
+            device_pacing: PacingStats::new(),
+            pull_pacing: PacingStats::new(),
         }
-    }
-
-    /// Registra el delta entre frames consecutivos. A 60fps sano: ~16.7ms
-    /// uniformes. Ráfagas (<8ms) seguidas de huecos (>25ms) = judder
-    /// aunque el promedio dé 60.
-    fn record_pacing(&mut self, timestamp: f64) {
-        if let Some(prev) = self.pacing_last.replace(timestamp) {
-            let delta_ms = ((timestamp - prev) * 1000.0) as f32;
-            if delta_ms < 8.0 {
-                self.pacing_bursts += 1;
-            }
-            if delta_ms > 25.0 {
-                self.pacing_gaps += 1;
-            }
-            self.pacing_deltas_ms.push(delta_ms);
-            // ventana móvil ~15s de deltas
-            let max = 15 * 120;
-            if self.pacing_deltas_ms.len() > max {
-                let drop = self.pacing_deltas_ms.len() - max;
-                self.pacing_deltas_ms.drain(..drop);
-            }
-        }
-    }
-
-    fn pacing_p50_ms(&self) -> f32 {
-        if self.pacing_deltas_ms.is_empty() {
-            return 0.0;
-        }
-        let mut v = self.pacing_deltas_ms.clone();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        v[v.len() / 2]
     }
 }
 
@@ -152,6 +210,9 @@ pub struct VideoCapture {
     /// pisar el presupuesto del hilo de UI (judder). Calibrado por el
     /// usuario contra el monitor físico; persiste en ~/.scalapp_color.
     color_adjust: Arc<Mutex<(f32, f32)>>,
+    /// Trace de eventos (SCALAPP_TRACE) — stores acá, paints desde el
+    /// renderer via trace_log().
+    trace: Arc<Mutex<Trace>>,
     /// Notificador de frame nuevo (Fase 2-lite): el thread de captura lo
     /// llama al almacenar cada frame — el renderer lo usa para disparar
     /// el repaint EXACTO cuando hay algo nuevo que pintar (adiós a
@@ -184,6 +245,7 @@ impl VideoCapture {
             allow_index_scan: true,
             frame_notifier: Arc::new(Mutex::new(None)),
             color_adjust: Arc::new(Mutex::new((1.0, 1.0))),
+            trace: Arc::new(Mutex::new(Trace::from_env())),
             allow_webcam: false,
             latest: Arc::new(Mutex::new(None)),
             frame_seq: Arc::new(AtomicU64::new(0)),
@@ -437,15 +499,30 @@ impl VideoCapture {
                         if (rg - 1.0).abs() > 1e-3 || (sat - 1.0).abs() > 1e-3 {
                             apply_color_adjust(&mut raw, rg, sat);
                         }
-                        let timestamp = start_time.elapsed().as_secs_f64();
+                        let pull_ts = start_time.elapsed().as_secs_f64();
+                        // reloj del DEVICE (capture_timestamp de AVFoundation):
+                        // la llegada REAL de la señal — no nuestro ritmo de
+                        // consumo. Si difiere del pull, la ráfaga nace en la
+                        // entrega de buffers, no en la fuente.
+                        let dev_ts = frame_buffer
+                            .capture_timestamp()
+                            .map(|d| d.as_secs_f64());
                         let frame = TimestampedFrame {
                             data: Arc::new(raw),
                             width,
                             height,
-                            timestamp,
+                            timestamp: pull_ts,
                             frame_number: self.frame_seq.fetch_add(1, Ordering::Relaxed),
                         };
+                        let frame_no = frame.frame_number;
                         store_frame(&self.latest, &self.displayed, &self.stats, frame);
+                        self.trace.lock().unwrap().log(
+                            "store",
+                            &format!(
+                                "frame={frame_no} dev={:.3} pull={pull_ts:.3}",
+                                dev_ts.unwrap_or(0.0)
+                            ),
+                        );
                         // Fase 2-lite: el arrival del frame dispara el
                         // repaint del renderer (pintar exactamente cuando
                         // hay frame nuevo, no cuando el timer se dé)
@@ -453,8 +530,11 @@ impl VideoCapture {
                             cb();
                         }
                         let mut stats = self.stats.lock().unwrap();
-                        stats.last_frame_time = Some(timestamp);
-                        stats.record_pacing(timestamp);
+                        stats.last_frame_time = Some(pull_ts);
+                        if let Some(d) = dev_ts {
+                            stats.device_pacing.record(d);
+                        }
+                        stats.pull_pacing.record(pull_ts);
                         stats.fps_frame_count += 1;
                         let now = Instant::now();
                         let elapsed = now.duration_since(stats.last_fps_time).as_secs_f64();
@@ -509,6 +589,11 @@ impl VideoCapture {
         origin.map(|o| (o.elapsed().as_secs_f64() - frame.timestamp).max(0.0))
     }
 
+    /// Traza un evento del renderer (p.ej. paint) al archivo de trace.
+    pub fn trace_log(&self, event: &str, detail: &str) {
+        self.trace.lock().unwrap().log(event, detail);
+    }
+
     pub fn get_capture_stats(&self) -> CaptureStats {
         let stats = self.stats.lock().unwrap();
         CaptureStats {
@@ -516,9 +601,12 @@ impl VideoCapture {
             total_frames: stats.frame_count,
             skipped_frames: stats.skipped_frames,
             last_frame_time: stats.last_frame_time,
-            pacing_bursts: stats.pacing_bursts,
-            pacing_gaps: stats.pacing_gaps,
-            pacing_p50_ms: stats.pacing_p50_ms(),
+            device_bursts: stats.device_pacing.bursts,
+            device_gaps: stats.device_pacing.gaps,
+            device_p50_ms: stats.device_pacing.p50_ms(),
+            pull_bursts: stats.pull_pacing.bursts,
+            pull_gaps: stats.pull_pacing.gaps,
+            pull_p50_ms: stats.pull_pacing.p50_ms(),
         }
     }
 }

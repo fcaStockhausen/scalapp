@@ -46,8 +46,10 @@ struct VideoHealth {
     /// contadores previos para reportar DELTAS por ventana (los
     /// contadores de origen son acumulativos)
     prev_skip: u64,
-    prev_cap_bursts: u64,
-    prev_cap_gaps: u64,
+    prev_dev_bursts: u64,
+    prev_dev_gaps: u64,
+    prev_pull_bursts: u64,
+    prev_pull_gaps: u64,
     prev_paint_bursts: u64,
     prev_paint_gaps: u64,
 }
@@ -57,8 +59,10 @@ impl VideoHealth {
         Self {
             last: Instant::now(),
             prev_skip: 0,
-            prev_cap_bursts: 0,
-            prev_cap_gaps: 0,
+            prev_dev_bursts: 0,
+            prev_dev_gaps: 0,
+            prev_pull_bursts: 0,
+            prev_pull_gaps: 0,
             prev_paint_bursts: 0,
             prev_paint_gaps: 0,
         }
@@ -74,7 +78,8 @@ impl VideoHealth {
         out_fps: f32,
         loop_fps: f32,
         skipped: u64,
-        pacing: (u64, u64, f32),
+        device: (u64, u64, f32),
+        pull: (u64, u64, f32),
         paint: (u64, u64, f32),
         paint_tail: (f32, f32),
         target: u32,
@@ -82,27 +87,30 @@ impl VideoHealth {
         if self.last.elapsed().as_secs() < 15 {
             return;
         }
-        // deltas por ventana (la "ráfaga" acumulada desde el arranque
-        // no dice nada del comportamiento actual)
-        let (skip, cb, cg, pb, pg) = (
+        let (skip, db, dg, pb_, pg, pab, pag) = (
             skipped - self.prev_skip,
-            pacing.0 - self.prev_cap_bursts,
-            pacing.1 - self.prev_cap_gaps,
+            device.0 - self.prev_dev_bursts,
+            device.1 - self.prev_dev_gaps,
+            pull.0 - self.prev_pull_bursts,
+            pull.1 - self.prev_pull_gaps,
             paint.0 - self.prev_paint_bursts,
             paint.1 - self.prev_paint_gaps,
         );
         self.prev_skip = skipped;
-        self.prev_cap_bursts = pacing.0;
-        self.prev_cap_gaps = pacing.1;
+        self.prev_dev_bursts = device.0;
+        self.prev_dev_gaps = device.1;
+        self.prev_pull_bursts = pull.0;
+        self.prev_pull_gaps = pull.1;
         self.prev_paint_bursts = paint.0;
         self.prev_paint_gaps = paint.1;
         println!(
-            "[video @{}] cap {:.1} | out {:.1} | loop {:.1} | skip +{skip} | llegada: +{cb}ráf +{cg}huec p50 {:.1} | pintado: +{pb}ráf +{pg}huec p10 {:.1} p50 {:.1} p90 {:.1}ms (target {target})",
+            "[video @{}] cap {:.1} | out {:.1} | loop {:.1} | skip +{skip} | DEV: +{db}ráf +{dg}huec p50 {:.1} | PULL: +{pb_}ráf +{pg}huec p50 {:.1} | pintado: +{pab}ráf +{pag}huec p10 {:.1} p50 {:.1} p90 {:.1}ms (target {target})",
             crate::audio::wall_clock(),
             cap_fps,
             out_fps,
             loop_fps,
-            pacing.2,
+            device.2,
+            pull.2,
             paint_tail.0,
             paint.2,
             paint_tail.1,
@@ -275,6 +283,8 @@ impl RendererApp {
         self.last_frame_number = frame.frame_number;
         self.video.mark_displayed(frame.frame_number);
         self.painted_fps.tick();
+        self.video
+            .trace_log("paint", &format!("frame={}", frame.frame_number));
     }
 
     fn update_status(&mut self) {
@@ -502,7 +512,16 @@ impl eframe::App for RendererApp {
                 self.painted_fps.fps,
                 self.loop_fps.fps,
                 cap_stats.skipped_frames,
-                (cap_stats.pacing_bursts, cap_stats.pacing_gaps, cap_stats.pacing_p50_ms),
+                (
+                    cap_stats.device_bursts,
+                    cap_stats.device_gaps,
+                    cap_stats.device_p50_ms,
+                ),
+                (
+                    cap_stats.pull_bursts,
+                    cap_stats.pull_gaps,
+                    cap_stats.pull_p50_ms,
+                ),
                 (self.paint_bursts, self.paint_gaps, paint_pct(50)),
                 (paint_pct(10), paint_pct(90)),
                 self.video.fps,
