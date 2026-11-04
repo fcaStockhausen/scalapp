@@ -91,6 +91,17 @@ impl PacingStats {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         v[v.len() / 2]
     }
+
+    /// Período medio de la ventana: promedio de los deltas (la
+    /// cuantización de 1ms del DEV se promedia sobre ~900 muestras →
+    /// error <0.05ms). Tasa REAL de la señal: 59.94 vs 60.00.
+    fn window_rate_ms(&self) -> f32 {
+        let n = self.deltas.len();
+        if n < 10 {
+            return 16.7;
+        }
+        self.deltas.iter().sum::<f32>() / n as f32
+    }
 }
 
 /// Trace de eventos con timestamp (SCALAPP_TRACE=<path>): stores del
@@ -264,6 +275,15 @@ impl VideoCapture {
     /// captura — lo alimenta el renderer desde los sliders.
     pub fn set_color_adjust(&self, red_gain: f32, saturation: f32) {
         *self.color_adjust.lock().unwrap() = (red_gain, saturation);
+    }
+
+    /// Tasa de frames medida en el RELOJ DEL DEVICE (capture_timestamp
+    /// de AVFoundation): (último - primero) / muestras de la ventana.
+    /// Es el período REAL de la señal (59.94 vs 60.00 etc.) — el pacer
+    /// del renderer se ancla a esto, no a nuestro consumo.
+    pub fn device_rate_ms(&self) -> f32 {
+        let stats = self.stats.lock().unwrap();
+        stats.device_pacing.window_rate_ms()
     }
 
     pub fn set_frame_notifier(&self, cb: Option<Box<dyn Fn() + Send>>) {

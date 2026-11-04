@@ -139,6 +139,15 @@ pub struct RendererApp {
     borderless: bool,
     status_text: String,
     audio_streams: Option<std::sync::Arc<std::sync::Mutex<AudioStreams>>>,
+    /// FRAME PACER: presentar cada frame en su deadline propio
+    /// (ancla + n·tasa_medida_del_device) en vez de "cuando el loop
+    /// llegue". Desacopla la cadencia de presentación del ritmo del
+    /// update loop: con el loop a ~11ms inconmensurable con 16.7ms, la
+    /// latencia de pintado oscilaba 0-11ms a plena amplitud (= patrón
+    /// bimodal 5.7/27.7ms medido en el trace). El pacer fija la FASE.
+    pace_anchor: Option<(u64, Instant)>, // (frame_number ancla, instante)
+    pace_rate_ms: f32,                   // tasa medida del device (DEV)
+    next_deadline: Option<Instant>,
     /// Contador de fps del RENDER (frames pintados).
     painted_fps: FpsMeter,
     /// Repaints por segundo del loop de egui.
@@ -192,6 +201,9 @@ impl RendererApp {
             painted_fps: FpsMeter::new(),
             loop_fps: FpsMeter::new(),
             health: VideoHealth::new(),
+            pace_anchor: None,
+            pace_rate_ms: 16.7,
+            next_deadline: None,
             red_gain: 1.0,
             saturation: 1.0,
         };
@@ -245,6 +257,40 @@ impl RendererApp {
         };
         if frame.frame_number == self.last_frame_number {
             return;
+        }
+        // FRAME PACER: cada frame tiene deadline = ancla + n·tasa_dev.
+        // No se pinta antes de su deadline — la cadencia de presentación
+        // queda anclada al RELOJ DE LA SEÑAL (tasa medida en DEV), no al
+        // ritmo del update loop. Si llegamos tarde (loop lento), se pinta
+        // ya: nunca acumular.
+        let rate = self.video.device_rate_ms();
+        if rate > 5.0 && rate < 100.0 {
+            self.pace_rate_ms = rate;
+        }
+        let now = Instant::now();
+        let deadline = match self.pace_anchor {
+            Some((anchor_n, anchor_t)) => {
+                anchor_t + Duration::from_secs_f64(
+                    (frame.frame_number - anchor_n) as f64 * self.pace_rate_ms as f64 / 1000.0,
+                )
+            }
+            None => {
+                // primer frame: anclar AHORA (deadline inmediato)
+                self.pace_anchor = Some((frame.frame_number, now));
+                now
+            }
+        };
+        self.next_deadline = Some(deadline);
+        if now < deadline {
+            // guard anti-deriva: si la tasa medida quedó más lenta que la
+            // real, el deadline se aleja progresivamente — re-ancrar en
+            // vez de acumular latencia
+            if (deadline - now).as_millis() > 20 {
+                self.pace_anchor = Some((frame.frame_number, now));
+                self.next_deadline = Some(now);
+            } else {
+                return; // temprano: esperar al deadline
+            }
         }
         let paint_now = Instant::now();
         if let Some(prev) = self.last_paint.replace(paint_now) {
@@ -528,14 +574,19 @@ impl eframe::App for RendererApp {
             );
         }
         self.update_status();
-        // Fase 1: 8ms mientras llega el repaint dirigido por frames (Fase 2)
-        // heartbeat de repaint: base cuando no llegan frames. El arrival
-        // notifier (Fase 2-lite) agrega repaints al llegar cada frame.
+        // Repaint scheduling: si el PACER tiene un deadline pendiente,
+        // despertar EXACTO ahí (la presentación va anclada al reloj de la
+        // señal); si no, heartbeat de respaldo.
         let hb = std::env::var("SCALAPP_HEARTBEAT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(8);
-        ctx.request_repaint_after(Duration::from_millis(hb));
+            .unwrap_or(100);
+        match self.next_deadline {
+            Some(d) if d > Instant::now() => {
+                ctx.request_repaint_after(d - Instant::now());
+            }
+            _ => ctx.request_repaint_after(Duration::from_millis(hb)),
+        }
     }
 }
 
