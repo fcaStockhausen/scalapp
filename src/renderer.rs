@@ -255,43 +255,52 @@ impl RendererApp {
             Some(f) => f,
             None => return,
         };
-        if frame.frame_number == self.last_frame_number {
-            return;
-        }
-        // FRAME PACER: cada frame tiene deadline = ancla + n·tasa_dev.
-        // No se pinta antes de su deadline — la cadencia de presentación
-        // queda anclada al RELOJ DE LA SEÑAL (tasa medida en DEV), no al
-        // ritmo del update loop. Si llegamos tarde (loop lento), se pinta
-        // ya: nunca acumular.
+        // FRAME PACER: presentar cada frame en su deadline
+        // (ancla + n·tasa_dev + offset). La cadencia queda anclada al
+        // reloj de la señal, no al ritmo del update loop.
         let rate = self.video.device_rate_ms();
-        if rate > 5.0 && rate < 100.0 {
+        if (5.0..100.0).contains(&rate) {
             self.pace_rate_ms = rate;
         }
         let now = Instant::now();
-        let deadline = match self.pace_anchor {
-            Some((anchor_n, anchor_t)) => {
-                anchor_t + Duration::from_secs_f64(
-                    (frame.frame_number - anchor_n) as f64 * self.pace_rate_ms as f64 / 1000.0,
-                )
-            }
-            None => {
-                // primer frame: anclar AHORA (deadline inmediato)
-                self.pace_anchor = Some((frame.frame_number, now));
-                now
-            }
+        // ancla en el primer frame VISTO (≈ su llegada): los deadlines
+        // quedan alineados a la grilla de arrivals + offset de seguridad
+        if self.pace_anchor.is_none() {
+            self.pace_anchor = Some((frame.frame_number, now));
+        }
+        let (n0, t0) = self.pace_anchor.unwrap();
+        // +1.5ms de seguridad: al deadline, el frame ya llegó (absorbe
+        // el jitter de llegada sin pintar en el deadline equivocado)
+        let pace_rate = self.pace_rate_ms;
+        let deadline_for = move |n: u64| {
+            t0 + Duration::from_secs_f64((n - n0) as f64 * pace_rate as f64 / 1000.0 + 0.0015)
         };
-        self.next_deadline = Some(deadline);
+
+        if frame.frame_number == self.last_frame_number {
+            // ya pintado: agendar el próximo de la grilla (NUNCA dejar
+            // un deadline vencido — era el bug del colapso a 12fps)
+            let next = self.last_frame_number.saturating_add(1).max(frame.frame_number);
+            self.next_deadline = Some(deadline_for(next));
+            return;
+        }
+        let deadline = deadline_for(frame.frame_number);
         if now < deadline {
-            // guard anti-deriva: si la tasa medida quedó más lenta que la
-            // real, el deadline se aleja progresivamente — re-ancrar en
-            // vez de acumular latencia
-            if (deadline - now).as_millis() > 20 {
+            // guard anti-deriva: tasa medida más lenta que la real → el
+            // deadline se aleja → re-anclear en vez de acumular latencia
+            if (deadline - now).as_millis() > 25 {
                 self.pace_anchor = Some((frame.frame_number, now));
-                self.next_deadline = Some(now);
             } else {
+                self.next_deadline = Some(deadline);
                 return; // temprano: esperar al deadline
             }
         }
+        // (tarde o a tiempo: pintar — el código de conversión sigue)
+        self.paint_now(frame.width, frame.height, &frame.data);
+        self.last_frame_number = frame.frame_number;
+        self.video.mark_displayed(frame.frame_number);
+        self.painted_fps.tick();
+        self.video
+            .trace_log("paint", &format!("frame={}", frame.frame_number));
         let paint_now = Instant::now();
         if let Some(prev) = self.last_paint.replace(paint_now) {
             let delta = paint_now.duration_since(prev).as_secs_f32() * 1000.0;
@@ -307,17 +316,23 @@ impl RendererApp {
                 self.paint_deltas_ms.drain(..drop);
             }
         }
-        let w = frame.width as usize;
-        let h = frame.height as usize;
+        self.next_deadline = Some(deadline_for(frame.frame_number + 1));
+    }
+
+    /// Conversión RGB→RGBA + subida a textura (el cuerpo que era de
+    /// pull_frame antes del pacer).
+    fn paint_now(&mut self, w: u32, h: u32, data: &[u8]) {
+        let w = w as usize;
+        let h = h as usize;
         let expected_src = w * h * 3;
-        if frame.data.len() < expected_src {
+        if data.len() < expected_src {
             return;
         }
         // RGB → RGBA en buffer reutilizado (el alpha queda fijado en 255).
-        // El ajuste de color corre en el THREAD DE CAPTURA (ver
-        // VideoCapture::set_color_adjust) — este loop queda liviano.
+        // El ajuste de color corre en el THREAD DE CAPTURA — este loop
+        // queda liviano.
         self.rgba.resize(w * h * 4, 255);
-        let src_pixels = frame.data.as_chunks::<3>().0;
+        let src_pixels = data.as_chunks::<3>().0;
         for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
             dst[0] = src[0];
             dst[1] = src[1];
@@ -326,11 +341,6 @@ impl RendererApp {
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.rgba);
         self.texture.set(image, egui::TextureOptions::LINEAR);
         self.texture_size = [w, h];
-        self.last_frame_number = frame.frame_number;
-        self.video.mark_displayed(frame.frame_number);
-        self.painted_fps.tick();
-        self.video
-            .trace_log("paint", &format!("frame={}", frame.frame_number));
     }
 
     fn update_status(&mut self) {
@@ -580,7 +590,7 @@ impl eframe::App for RendererApp {
         let hb = std::env::var("SCALAPP_HEARTBEAT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(100);
+            .unwrap_or(8);
         match self.next_deadline {
             Some(d) if d > Instant::now() => {
                 ctx.request_repaint_after(d - Instant::now());

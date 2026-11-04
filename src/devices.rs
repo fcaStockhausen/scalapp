@@ -374,6 +374,27 @@ pub fn video_device_map() -> Vec<VideoDeviceEntry> {
         .collect()
 }
 
+/// Caché del último capturadora usada con éxito (~/.scalapp_device):
+/// cuando el discovery de AVFoundation se cuelga (visto: device visible
+/// en ioreg pero ausente del query tras caídas de bus), la apertura
+/// DIRECTA por uniqueID sigue funcionando — el arranque cae al caché.
+pub fn cached_device_uid() -> Option<String> {
+    std::fs::read_to_string(device_cache_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn cache_device_uid(uid: &str) {
+    let _ = std::fs::write(device_cache_path(), uid);
+}
+
+fn device_cache_path() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    p.push(".scalapp_device");
+    p
+}
+
 /// Imprime el mapa con la clasificación — visible siempre en el arranque
 /// para que la decisión de selección sea auditable.
 pub fn print_video_device_map() {

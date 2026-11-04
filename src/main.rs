@@ -393,17 +393,37 @@ fn run(args: Args) -> Result<()> {
                             "Auto-detected HDMI video device: {} (ID: {})",
                             c.name, c.id
                         );
+                        devices::cache_device_uid(&c.unique_id);
                         CameraIndex::String(c.unique_id.clone())
                     }
                     None => {
-                        // ANTES: fallback a ciegas al índice 1 — llegó a
-                        // entregar la FaceTime a 30fps cuando Discord tenía
-                        // tomada la capturadora. Mejor fallar con diagnóstico.
-                        bail!(
-                            "no se pudo abrir ninguna capturadora HDMI de video.\n\
-                             \x20 Si Discord/OBS está corriendo, puede tener el device tomado \
-                             (Lock Rejected en el log) — cerralo o quitale la cámara y reintentá."
-                        );
+                        // Discovery ciego o colgado: la capturadora puede
+                        // seguir abrible por uniqueID directo (visto tras
+                        // caídas de bus: ioreg la ve, el query no). Caer al
+                        // uid del último arranque exitoso.
+                        if let Some(uid) = devices::cached_device_uid() {
+                            println!("Sin capturadoras por discovery — probando caché ({uid})");
+                            if let Some((w, h, fps, name)) = devices::probe_camera_by_id(&uid) {
+                                println!(
+                                    "  -> Capturadora por caché: {name} {w}x{h}@{fps:.0}fps"
+                                );
+                                devices::cache_device_uid(&uid);
+                                CameraIndex::String(uid)
+                            } else {
+                                bail!(
+                                    "no se pudo abrir ninguna capturadora HDMI de video.\n\
+                                     \x20 El discovery no la ve y el caché ({uid}) no abrió. \
+                                     Si Discord/OBS corre, puede tener el device tomado — \
+                                     cerralo y reintentá; si sigue, replug de la capturadora."
+                                );
+                            }
+                        } else {
+                            bail!(
+                                "no se pudo abrir ninguna capturadora HDMI de video.\n\
+                                 \x20 Si Discord/OBS está corriendo, puede tener el device tomado \
+                                 (Lock Rejected en el log) — cerralo o quitale la cámara y reintentá."
+                            );
+                        }
                     }
                 }
             }
