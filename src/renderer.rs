@@ -255,48 +255,17 @@ impl RendererApp {
             Some(f) => f,
             None => return,
         };
-        // FRAME PACER: presentar cada frame en su deadline
-        // (ancla + n·tasa_dev + offset). La cadencia queda anclada al
-        // reloj de la señal, no al ritmo del update loop.
-        let rate = self.video.device_rate_ms();
-        if (5.0..100.0).contains(&rate) {
-            self.pace_rate_ms = rate;
-        }
-        let now = Instant::now();
-        // ancla en el primer frame VISTO (≈ su llegada): los deadlines
-        // quedan alineados a la grilla de arrivals + offset de seguridad
-        if self.pace_anchor.is_none() {
-            self.pace_anchor = Some((frame.frame_number, now));
-        }
-        let (n0, t0) = self.pace_anchor.unwrap();
-        // +1.5ms de seguridad: al deadline, el frame ya llegó (absorbe
-        // el jitter de llegada sin pintar en el deadline equivocado)
-        let pace_rate = self.pace_rate_ms;
-        let deadline_for = move |n: u64| {
-            t0 + Duration::from_secs_f64((n - n0) as f64 * pace_rate as f64 / 1000.0 + 0.0015)
-        };
-
         if frame.frame_number == self.last_frame_number {
-            // ya pintado: agendar el próximo de la grilla (NUNCA dejar
-            // un deadline vencido — era el bug del colapso a 12fps)
-            let next = self.last_frame_number.saturating_add(1).max(frame.frame_number);
-            self.next_deadline = Some(deadline_for(next));
             return;
         }
-        let deadline = deadline_for(frame.frame_number);
-        if now < deadline {
-            // guard anti-deriva: tasa medida más lenta que la real → el
-            // deadline se aleja → re-anclear Y PINTAR YA (el deadline viejo
-            // quedó calculado con el ancla anterior: usarlo = congelarse)
-            if (deadline - now).as_millis() > 25 {
-                self.pace_anchor = Some((frame.frame_number, now));
-                // cae through: pintar inmediato con el ancla nueva
-            } else {
-                self.next_deadline = Some(deadline);
-                return; // temprano: esperar al deadline
-            }
-        }
-        // (tarde o a tiempo: pintar — el código de conversión sigue)
+        // PACING v3 (lección de 3 iteraciones): las llegadas ya son
+        // perfectas (DEV p50 16.7 limpio SIEMPRE) — pintar EN LA LLEGADA
+        // da latencia constante ≈ 0 y cadencia = cadencia de la señal.
+        // El judder histórico nacía del TIMER de 8ms (grilla
+        // inconmensurable con 16.7 compitiendo con las llegadas); el
+        // pacer de deadlines agregó una TERCERA grilla que peleaba igual.
+        // Sin gate, sin anclas: el arrival notifier despierta el loop,
+        // esto pinta ya. El heartbeat queda a 100ms solo para la UI.
         self.paint_now(frame.width, frame.height, &frame.data);
         self.last_frame_number = frame.frame_number;
         self.video.mark_displayed(frame.frame_number);
@@ -318,7 +287,6 @@ impl RendererApp {
                 self.paint_deltas_ms.drain(..drop);
             }
         }
-        self.next_deadline = Some(deadline_for(frame.frame_number + 1));
     }
 
     /// Conversión RGB→RGBA + subida a textura (el cuerpo que era de
@@ -592,13 +560,11 @@ impl eframe::App for RendererApp {
         let hb = std::env::var("SCALAPP_HEARTBEAT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(8);
-        match self.next_deadline {
-            Some(d) if d > Instant::now() => {
-                ctx.request_repaint_after(d - Instant::now());
-            }
-            _ => ctx.request_repaint_after(Duration::from_millis(hb)),
-        }
+            .unwrap_or(100);
+        // v3: solo heartbeat bajo — el arrival notifier despierta el loop
+        // por frame; NINGÚN timer rápido compitiendo con la grilla de
+        // llegadas (era la causa del judder: 8ms inconmensurable con 16.7)
+        ctx.request_repaint_after(Duration::from_millis(hb));
     }
 }
 
