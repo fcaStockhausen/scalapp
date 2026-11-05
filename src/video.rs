@@ -95,12 +95,25 @@ impl PacingStats {
     /// Período medio de la ventana: promedio de los deltas (la
     /// cuantización de 1ms del DEV se promedia sobre ~900 muestras →
     /// error <0.05ms). Tasa REAL de la señal: 59.94 vs 60.00.
+    /// Promedio de tasa EXCLUYENDO outliers (deltas fuera de 5..40ms):
+    /// un hiccup del device de 500ms arrastraría el promedio puro y el
+    /// pacer derivaría (con el guard de re-anclaje como segunda red).
     fn window_rate_ms(&self) -> f32 {
-        let n = self.deltas.len();
+        if self.deltas.len() < 10 {
+            return 16.7;
+        }
+        let mut sum = 0.0f32;
+        let mut n = 0usize;
+        for d in &self.deltas {
+            if (5.0..40.0).contains(d) {
+                sum += d;
+                n += 1;
+            }
+        }
         if n < 10 {
             return 16.7;
         }
-        self.deltas.iter().sum::<f32>() / n as f32
+        sum / n as f32
     }
 }
 

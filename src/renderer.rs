@@ -286,9 +286,11 @@ impl RendererApp {
         let deadline = deadline_for(frame.frame_number);
         if now < deadline {
             // guard anti-deriva: tasa medida más lenta que la real → el
-            // deadline se aleja → re-anclear en vez de acumular latencia
+            // deadline se aleja → re-anclear Y PINTAR YA (el deadline viejo
+            // quedó calculado con el ancla anterior: usarlo = congelarse)
             if (deadline - now).as_millis() > 25 {
                 self.pace_anchor = Some((frame.frame_number, now));
+                // cae through: pintar inmediato con el ancla nueva
             } else {
                 self.next_deadline = Some(deadline);
                 return; // temprano: esperar al deadline
