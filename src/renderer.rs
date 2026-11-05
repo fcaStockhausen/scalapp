@@ -131,7 +131,6 @@ pub struct RendererApp {
     paint_gaps: u64,
     paint_deltas_ms: Vec<f32>,
     /// Buffer RGBA reutilizado frame a frame (sin realloc por frame).
-    rgba: Vec<u8>,
     texture_size: [usize; 2],
     show_overlay: bool,
     show_stats: bool,
@@ -188,7 +187,6 @@ impl RendererApp {
             paint_bursts: 0,
             paint_gaps: 0,
             paint_deltas_ms: Vec::new(),
-            rgba: Vec::new(),
             texture_size: [1, 1],
             show_overlay: false,
             show_stats: false,
@@ -289,26 +287,17 @@ impl RendererApp {
         }
     }
 
-    /// Conversión RGB→RGBA + subida a textura (el cuerpo que era de
-    /// pull_frame antes del pacer).
+    /// Subida a textura: los frames ya llegan RGBA del thread de captura
+    /// (decode YUYV→RGBA en una pasada allá) — aquí solo se copian a la
+    /// textura de egui. El loop de UI quedó liviano.
     fn paint_now(&mut self, w: u32, h: u32, data: &[u8]) {
         let w = w as usize;
         let h = h as usize;
-        let expected_src = w * h * 3;
-        if data.len() < expected_src {
+        let expected = w * h * 4;
+        if data.len() < expected {
             return;
         }
-        // RGB → RGBA en buffer reutilizado (el alpha queda fijado en 255).
-        // El ajuste de color corre en el THREAD DE CAPTURA — este loop
-        // queda liviano.
-        self.rgba.resize(w * h * 4, 255);
-        let src_pixels = data.as_chunks::<3>().0;
-        for (dst, src) in self.rgba.as_chunks_mut::<4>().0.iter_mut().zip(src_pixels) {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-        }
-        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.rgba);
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &data[..expected]);
         self.texture.set(image, egui::TextureOptions::LINEAR);
         self.texture_size = [w, h];
     }

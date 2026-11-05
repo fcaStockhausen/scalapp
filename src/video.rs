@@ -183,6 +183,7 @@ impl StatsInner {
 
 /// Transforma un buffer RGB24 in-place: gain de R + mezcla hacia luma
 /// (saturación). Corre en el thread de captura — fuera del loop de UI.
+#[allow(dead_code)]
 fn apply_color_adjust(buf: &mut [u8], rg: f32, sat: f32) {
     for px in buf.as_chunks_mut::<3>().0.iter_mut() {
         let r = px[0] as f32 * rg;
@@ -193,6 +194,43 @@ fn apply_color_adjust(buf: &mut [u8], rg: f32, sat: f32) {
         px[1] = (luma + (g - luma) * sat).clamp(0.0, 255.0) as u8;
         px[2] = (luma + (b - luma) * sat).clamp(0.0, 255.0) as u8;
     }
+}
+
+/// Decode YUYV → RGBA en UNA sola pasada, con el ajuste de color inline.
+/// Reemplaza la cadena de 3 pasadas (decode nokhwa → color adjust →
+/// RGB→RGBA en el renderer): 2M px/frame × 3 menos trabajo de CPU por
+/// frame (el calor de la Mac era esto — la GPU solo compone).
+///
+/// Coeficientes BT.601 limited-range EXACTOS de nokhwa (yuyv444_to_rgb,
+/// punto fijo) para preservar la calibración de color del usuario.
+fn decode_yuyv_to_rgba(yuyv: &[u8], red_gain: f32, saturation: f32) -> Vec<u8> {
+    let neutral = (red_gain - 1.0).abs() <= 1e-3 && (saturation - 1.0).abs() <= 1e-3;
+    let mut out = Vec::with_capacity((yuyv.len() / 4) * 8);
+    for chunk in yuyv.chunks_exact(4) {
+        let y1 = i32::from(chunk[0]);
+        let d = i32::from(chunk[1]) - 128; // U - 128
+        let y2 = i32::from(chunk[2]);
+        let e = i32::from(chunk[3]) - 128; // V - 128
+        for y in [y1, y2] {
+            let c298 = (y - 16) * 298;
+            let r = ((c298 + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((c298 - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((c298 + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+            if neutral {
+                out.extend_from_slice(&[r, g, b, 255]);
+            } else {
+                let rf = f32::from(r) * red_gain;
+                let gf = f32::from(g);
+                let bf = f32::from(b);
+                let luma = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+                out.push((luma + (rf - luma) * saturation).clamp(0.0, 255.0) as u8);
+                out.push((luma + (gf - luma) * saturation).clamp(0.0, 255.0) as u8);
+                out.push((luma + (bf - luma) * saturation).clamp(0.0, 255.0) as u8);
+                out.push(255);
+            }
+        }
+    }
+    out
 }
 
 /// Almacena `frame` en el slot latest-wins. Si el frame reemplazado nunca
@@ -521,17 +559,15 @@ impl VideoCapture {
                             *d += 1;
                         }
                     }
-                    match frame_buffer.decode_image::<RgbFormat>() {
-                    Ok(image) => {
-                        let width = image.width();
-                        let height = image.height();
-                        let mut raw = image.into_raw();
-                        // ajuste de color AQUÍ (thread de captura, no el de
-                        // UI): por-píxel gain de R + mezcla a luma
-                        let (rg, sat) = *self.color_adjust.lock().unwrap();
-                        if (rg - 1.0).abs() > 1e-3 || (sat - 1.0).abs() > 1e-3 {
-                            apply_color_adjust(&mut raw, rg, sat);
-                        }
+                    // decode YUYV→RGBA en UNA pasada (decode + color + alpha):
+                    // reemplaza las 3 pasadas anteriores (nokhwa decode →
+                    // color adjust → RGB→RGBA del renderer)
+                    let (rg, sat) = *self.color_adjust.lock().unwrap();
+                    let resolution = frame_buffer.resolution();
+                    let rgba = decode_yuyv_to_rgba(frame_buffer.buffer(), rg, sat);
+                    {
+                        let width = resolution.width_x;
+                        let height = resolution.height_y;
                         let pull_ts = start_time.elapsed().as_secs_f64();
                         // reloj del DEVICE (capture_timestamp de AVFoundation):
                         // la llegada REAL de la señal — no nuestro ritmo de
@@ -541,7 +577,7 @@ impl VideoCapture {
                             .capture_timestamp()
                             .map(|d| d.as_secs_f64());
                         let frame = TimestampedFrame {
-                            data: Arc::new(raw),
+                            data: Arc::new(rgba),
                             width,
                             height,
                             timestamp: pull_ts,
@@ -577,11 +613,6 @@ impl VideoCapture {
                             stats.last_fps_time = now;
                         }
                         stats.frame_count = self.frame_seq.load(Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        eprintln!("Frame decode error: {e}");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
                     }
                 },
                 Err(_) => {
@@ -655,6 +686,42 @@ mod tests {
             height: 2,
             timestamp: n as f64 / 60.0,
             frame_number: n,
+        }
+    }
+
+    #[test]
+    fn yuyv_to_rgba_matches_nokhwa_byte_a_byte() {
+        // YUYV sintético variado (Y, U, Y, V)
+        let mut yuyv = Vec::new();
+        for i in 0..128u8 {
+            yuyv.extend_from_slice(&[i, 30 + i % 200, 255 - i, 50 + i % 190]);
+        }
+        let ours = decode_yuyv_to_rgba(&yuyv, 1.0, 1.0);
+        let theirs = nokhwa_core::types::yuyv422_to_rgb(&yuyv, false).unwrap();
+        for (px, (o, t)) in ours
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(theirs.as_chunks::<3>().0)
+            .enumerate()
+        {
+            assert_eq!(o[0], t[0], "R en px {px}");
+            assert_eq!(o[1], t[1], "G en px {px}");
+            assert_eq!(o[2], t[2], "B en px {px}");
+            assert_eq!(o[3], 255, "alpha en px {px}");
+        }
+    }
+
+    #[test]
+    fn yuyv_to_rgba_saturation_zero_is_grayscale() {
+        let mut yuyv = Vec::new();
+        for i in 0..64u8 {
+            yuyv.extend_from_slice(&[i, 30 + i % 200, 255 - i, 50 + i % 190]);
+        }
+        let gray = decode_yuyv_to_rgba(&yuyv, 1.0, 0.0);
+        for px in gray.as_chunks::<4>().0 {
+            assert_eq!(px[0], px[1], "gris: R=G");
+            assert_eq!(px[1], px[2], "gris: G=B");
         }
     }
 
