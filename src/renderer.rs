@@ -177,8 +177,20 @@ impl RendererApp {
         // Fase 2-lite: cada frame que llega dispara el repaint — el
         // render ocurre exactamente cuando hay algo nuevo que pintar
         // (los bursts del device ya no se pierden entre timers).
+        //
+        // CON 1ms, NO con request_repaint(): egui DUPLICA por diseño
+        // todo repaint de delay cero (context.rs: "Each request results
+        // in two repaints, just to give some things time to settle" —
+        // un parche para tooltips/respuestas retardadas de UI). Con 60
+        // llegadas/s eso son 120 pasadas de egui/s = el doble de CPU,
+        // GPU y WindowServer presentando contenido idéntico. Con
+        // delay>0 no hay duplicación y el callback dispara igual de
+        // inmediato (egui resta predicted_dt del delay).
         let ctx_for_video = cc.egui_ctx.clone();
-        video.set_frame_notifier(Some(Box::new(move || ctx_for_video.request_repaint())));
+        video.set_frame_notifier(Some(Box::new(move || {
+            ctx_for_video
+                .request_repaint_after(Duration::from_millis(1));
+        })));
         let mut app = Self {
             sync,
             video,

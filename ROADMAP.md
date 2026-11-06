@@ -142,3 +142,21 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
 - audio.rs/passthrough.rs quedaron como referencia de motor probado
   (deriva compensada, watchdog, colchón adaptativo) — el video puede
   copiar el patrón de latest-wins del consumer.
+- **egui DUPLICA por diseño todo `request_repaint()` de delay cero**
+  (6/11, hallado en fuente egui-0.29.1 context.rs:176: "Each request
+  results in two repaints, just to give some things time to settle" —
+  parche para tooltips/respuestas retardadas de UI). Nuestro arrival
+  notifier llamaba `request_repaint()` por frame → 60 llegadas/s se
+  volvían 120 pasadas/s de egui (loop 120.0 exacto) = doble CPU/GPU/
+  WindowServer presentando contenido idéntico. Fix: el notifier usa
+  `request_repaint_after(1ms)` — delay>0 no duplica, y el callback
+  dispara igual de inmediato (egui resta `predicted_dt` del delay).
+  Esperado post-fix: loop ~60-61, consumo a la mitad en la parte de
+  egui/WindowServer. NOTA: el patrón arrival→texture.set+request_repaint
+  es el canónico (egui-video hace exactamente lo mismo, línea 407 de su
+  lib.rs) — el desperdicio es de egui, no del patrón.
+  Correlación empírica que este fix explica: las ventanas con loop 120.0
+  tenían pintado limpio (16.4/16.7/17.1); las de loop ~80-88 (vsync del
+  display sin slots para 120 pedidos/s) pintado bimodal 5.5-7.9/25-28ms
+  = judder. Pendiente de validación foreground: si con el loop a ~60 el
+  pintado queda limpio en TODAS las ventanas, el judder muere acá.
