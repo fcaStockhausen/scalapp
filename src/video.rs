@@ -243,6 +243,15 @@ fn decode_yuyv_to_rgba(yuyv: &[u8], red_gain: f32, saturation: f32) -> Vec<u8> {
     out
 }
 
+/// Reloj de pared en ms (para vigilancia de stall del supervisor entre
+/// sesiones; no se usa para pacing).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Almacena `frame` en el slot latest-wins. Si el frame reemplazado nunca
 /// fue mostrado por el renderer (`displayed` quedó atrás), cuenta como skip.
 fn store_frame(
@@ -305,6 +314,19 @@ pub struct VideoCapture {
     stats: Arc<Mutex<StatsInner>>,
     running: Arc<AtomicBool>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Señal de video caída (unplug USB): el supervisor la activa al
+    /// perder el stream y la desactiva al reconectar — el renderer la
+    /// usa para el cartel "SIN SEÑAL" sobre el último frame.
+    signal_lost: Arc<AtomicBool>,
+    /// Nombre human del device de la última sesión exitosa — permite
+    /// re-encontrarlo tras replug aunque cambie el uniqueID.
+    device_name: Arc<Mutex<Option<String>>>,
+    /// uniqueID "rebotado": tras un replug el device puede reaparecer
+    /// con OTRO uniqueID (el prefijo de locationID depende del puerto —
+    /// visto en terreno 0x2000…→0x1340…; el sufijo de serial sí es
+    /// estable). El supervisor guarda acá el uid fresco; open_camera
+    /// lo prefiere por sobre el original.
+    rebound_uid: Arc<Mutex<Option<String>>>,
 }
 
 impl VideoCapture {
@@ -326,6 +348,9 @@ impl VideoCapture {
             stats: Arc::new(Mutex::new(StatsInner::new())),
             running: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
+            signal_lost: Arc::new(AtomicBool::new(false)),
+            device_name: Arc::new(Mutex::new(None)),
+            rebound_uid: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -392,11 +417,20 @@ impl VideoCapture {
     ///    Exact → escaneo → Closest YUYV → Closest MJPEG, todo bajo
     ///    catch_unwind.
     fn open_camera(&self) -> Result<Camera, String> {
+        // Reconnect: si el device reapareció con OTRO uniqueID (cambio
+        // de puerto/ubicación USB), usar el uid fresco del supervisor.
+        let device: CameraIndex = self
+            .rebound_uid
+            .lock()
+            .unwrap()
+            .clone()
+            .map(CameraIndex::String)
+            .unwrap_or_else(|| self.device.clone());
         // VEDA DE WEBCAMS: clasificar el dispositivo objetivo ANTES de
         // abrirlo. Ningún camino de selección puede terminar en una
         // webcam/virtual (el bug histórico: fallback a ciegas → FaceTime
         // a 30fps mostrada como si fuera la capturadora).
-        let uid: Option<String> = match &self.device {
+        let uid: Option<String> = match &device {
             CameraIndex::String(s) => Some(s.clone()),
             CameraIndex::Index(i) => nokhwa_bindings_macos::query_avfoundation()
                 .ok()
@@ -420,7 +454,7 @@ impl VideoCapture {
                 }
             }
         }
-        let uid: Option<String> = match &self.device {
+        let uid: Option<String> = match &device {
             CameraIndex::String(s) => Some(s.clone()),
             CameraIndex::Index(i) => nokhwa_bindings_macos::query_avfoundation()
                 .ok()
@@ -455,7 +489,7 @@ impl VideoCapture {
                     );
                 }
                 if let Ok(camera) = devices::try_camera_new_retry(
-                    self.device.clone(),
+                    device.clone(),
                     RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(mode)),
                     3,
                 ) {
@@ -468,16 +502,16 @@ impl VideoCapture {
         let wanted = CameraFormat::new_from(self.width, self.height, FrameFormat::YUYV, self.fps);
         let exact = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(wanted));
 
-        match devices::try_camera_new(self.device.clone(), exact) {
+        match devices::try_camera_new(device.clone(), exact) {
             Ok(camera) => return Ok(camera),
             Err(e) => println!(
                 "Exact format {}x{}@{} YUYV rejected on {:?}: {e}",
-                self.width, self.height, self.fps, self.device
+                self.width, self.height, self.fps, device
             ),
         }
 
         if self.allow_index_scan {
-            if let CameraIndex::Index(primary) = self.device {
+            if let CameraIndex::Index(primary) = device {
                 for idx in 0..5u32 {
                     if idx == primary {
                         continue;
@@ -503,9 +537,9 @@ impl VideoCapture {
             }
         }
 
-        println!("Falling back to closest match on {:?}", self.device);
+        println!("Falling back to closest match on {:?}", device);
         if let Ok(camera) = devices::try_camera_new(
-            self.device.clone(),
+            device.clone(),
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(wanted)),
         ) {
             return Ok(camera);
@@ -514,27 +548,41 @@ impl VideoCapture {
         println!("No YUYV mode available — trying closest MJPEG");
         let mjpeg = CameraFormat::new_from(self.width, self.height, FrameFormat::MJPEG, self.fps);
         devices::try_camera_new(
-            self.device.clone(),
+            device.clone(),
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(mjpeg)),
         )
-        .map_err(|e| format!("cannot open camera device {:?}: {e}", self.device))
+        .map_err(|e| format!("cannot open camera device {:?}: {e}", device))
     }
 
-    fn capture_loop(&self, tx: std::sync::mpsc::Sender<Result<(u32, u32, f32), String>>) {
+    /// Sesión de captura: abre la cámara y streamea hasta que la señal
+    /// muera o cierre la app. Corre en el thread PULLER, que POSEE la
+    /// cámara. `activity` se actualiza con cada frame OK (el supervisor
+    /// lo vigila por tiempo); `stop` corta entre frames al cerrar.
+    ///
+    /// nokhwa/AVFoundation NO reporta el unplug: `frame()` es un
+    /// `flume recv()` SIN timeout — cuando el USB se cae, esta función
+    /// queda colgada ADENTRO de nokhwa para siempre (ni siquiera
+    /// devuelve Err). El supervisor lo detecta por inactividad y lo
+    /// reemplaza; este thread queda detached (leak documentado, acotado
+    /// a uno por caída — nokhwa no expone forma de interrumpirlo).
+    fn puller_session(
+        &self,
+        init_tx: std::sync::mpsc::Sender<Result<(u32, u32, f32), String>>,
+        activity: &AtomicU64,
+        stop: &AtomicBool,
+    ) {
         println!("Video capture thread started");
         let mut camera = match self.open_camera() {
             Ok(c) => c,
             Err(e) => {
                 let msg = format!("cannot open camera device {:?}: {e}", self.device);
-                let _ = tx.send(Err(msg));
-                self.running.store(false, Ordering::Relaxed);
+                let _ = init_tx.send(Err(msg));
                 return;
             }
         };
         if let Err(e) = camera.open_stream() {
             let msg = format!("cannot start camera stream: {e}");
-            let _ = tx.send(Err(msg));
-            self.running.store(false, Ordering::Relaxed);
+            let _ = init_tx.send(Err(msg));
             return;
         }
         let resolution = camera.resolution();
@@ -544,7 +592,13 @@ impl VideoCapture {
         let raw_dump = std::env::var("SCALAPP_RAW_DUMP").ok();
         let raw_count = Arc::new(Mutex::new(0u32));
         *self.clock_origin.lock().unwrap() = Some(start_time);
-        let _ = tx.send(Ok((resolution.width_x, resolution.height_y, actual_fps)));
+        // actividad desde el arranque: el supervisor no debe declarar
+        // stall entre el init y el primer frame
+        activity.store(now_ms(), Ordering::Relaxed);
+        let _ = init_tx.send(Ok((resolution.width_x, resolution.height_y, actual_fps)));
+        // nombre para el re-encuentro tras replug (el uniqueID puede
+        // cambiar de puerto a puerto; el nombre no)
+        *self.device_name.lock().unwrap() = Some(camera.info().human_name().to_string());
         println!(
             "Camera setup: {}x{} @ {actual_fps:.2} FPS (requested exact {}x{}@{} YUYV, device: {})",
             resolution.width_x,
@@ -555,9 +609,16 @@ impl VideoCapture {
             camera.info().human_name()
         );
 
-        while self.running.load(Ordering::Relaxed) {
+        // Err sostenido ≈1.5s = sesión muerta que SÍ reporta (p.ej. el
+        // device lo tomó otro proceso): cortar y dejar que el
+        // supervisor decida. El unplug silencioso (hang de recv) lo
+        // caza el supervisor por stall.
+        let mut errors = 0u32;
+        while self.running.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
             match camera.frame() {
                 Ok(frame_buffer) => {
+                    activity.store(now_ms(), Ordering::Relaxed);
+                    errors = 0;
                     // dump crudo para diagnóstico de color (SCALAPP_RAW_DUMP):
                     // guarda N frames YUYV sin decodificar
                     if let Some(path) = &raw_dump {
@@ -626,13 +687,215 @@ impl VideoCapture {
                     }
                 },
                 Err(_) => {
-                    println!("Failed to read frame from camera");
+                    errors += 1;
+                    if errors == 1 || errors % 100 == 0 {
+                        println!("Failed to read frame from camera ({errors})");
+                    }
                     std::thread::sleep(Duration::from_millis(10));
+                    if errors >= 150 {
+                        break;
+                    }
                 }
             }
         }
         let _ = camera.stop_stream();
+    }
+
+    /// SUPERVISOR de captura (antes era el capture_loop monolítico).
+    ///
+    /// Por sesión: spawnea un PULLER que posee la cámara y vigila su
+    /// actividad. Caída de señal (stall de frames o errores sostenidos)
+    /// → descarta la sesión, cartel "SIN SEÑAL", espera a que el device
+    /// reaparezca en AVFoundation (poll del uniqueID, sin abrir) y
+    /// REABRE con toda la cadena de validación de siempre (veda
+    /// anti-webcam, modo pre-validado, retries ante Lock Rejected).
+    /// El arranque inicial fallido mantiene el comportamiento
+    /// histórico: error limpio y la app termina.
+    fn capture_loop(
+        self: &Arc<Self>,
+        tx: std::sync::mpsc::Sender<Result<(u32, u32, f32), String>>,
+    ) {
+        println!("Video capture supervisor started");
+        let stall_ms: u64 = std::env::var("SCALAPP_VIDEO_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+        let mut first_session = true;
+
+        while self.running.load(Ordering::Relaxed) {
+            // ── sesión nueva: puller con su propia cámara ──
+            let activity = Arc::new(AtomicU64::new(0));
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let (init_tx, init_rx) =
+                std::sync::mpsc::channel::<Result<(u32, u32, f32), String>>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            {
+                let vc = Arc::clone(self);
+                let act = Arc::clone(&activity);
+                let stp = Arc::clone(&stop_flag);
+                let _ = std::thread::Builder::new()
+                    .name("video-puller".into())
+                    .spawn(move || {
+                        vc.puller_session(init_tx, &act, &stp);
+                        // done_tx se dropea acá: despierta al supervisor
+                        drop(done_tx);
+                    });
+            }
+
+            // ── arranque de la sesión (open con retries incluidos) ──
+            let mut session_alive = true;
+            match init_rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(Ok((w, h, fps))) => {
+                    if first_session {
+                        let _ = tx.send(Ok((w, h, fps)));
+                        first_session = false;
+                    } else {
+                        println!("[camera] ✓ stream de video RESTAURADO ({w}x{h}@{fps:.0})");
+                        self.signal_lost.store(false, Ordering::Relaxed);
+                    }
+                }
+                Ok(Err(msg)) => {
+                    if first_session {
+                        let _ = tx.send(Err(msg));
+                        self.running.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    println!("[camera] reconexión falló ({msg}) — reintentando…");
+                    session_alive = false;
+                }
+                Err(_) => {
+                    if first_session {
+                        let _ = tx.send(Err("video camera init timeout".into()));
+                        self.running.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    println!("[camera] init timeout en reconexión — reintentando…");
+                    session_alive = false;
+                }
+            }
+
+            // ── vigilancia: fin del puller o stall de frames ──
+            let mut cause = "";
+            if session_alive {
+                loop {
+                    if !self.running.load(Ordering::Relaxed) {
+                        // cierre de la app: cortar el puller y salir todo
+                        stop_flag.store(true, Ordering::Relaxed);
+                        let _ = done_rx.recv_timeout(Duration::from_secs(2));
+                        break;
+                    }
+                    if done_rx.try_recv().is_ok() {
+                        cause = "errores de frame sostenidos";
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    let last = activity.load(Ordering::Relaxed);
+                    if last != 0 && now_ms().saturating_sub(last) > stall_ms {
+                        stop_flag.store(true, Ordering::Relaxed);
+                        if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                            // colgado DENTRO de nokhwa (recv sin timeout):
+                            // thread abandonado — leak documentado arriba.
+                            println!(
+                                "[camera] puller colgado en recv() de nokhwa — thread abandonado"
+                            );
+                        }
+                        cause = "sin frames (¿USB desconectado?)";
+                        break;
+                    }
+                }
+                if !self.running.load(Ordering::Relaxed) {
+                    break; // cierre limpio de la app
+                }
+            } else {
+                // init de reconexión falló (p.ej. otro proceso tomó el
+                // device apenas reapareció) — NO es cierre de app:
+                // seguir reintentando en el ciclo de recuperación.
+                cause = "fallo de reconexión";
+            }
+
+            // ── señal perdida: cartel en pantalla + esperar el replug ──
+            self.signal_lost.store(true, Ordering::Relaxed);
+            *self.latest.lock().unwrap() = None;
+            self.stats.lock().unwrap().fps_actual = 0.0;
+            println!("[camera] ✗ señal de video perdida ({cause}) — esperando reconexión…");
+
+            // Esperar a que el device reaparezca (matching tolerante a
+            // cambio de uniqueID por puerto — ver wait_device_back).
+            self.wait_device_back();
+            // settle: la MS2131 re-enumera formatos al volver al bus;
+            // no martillar el open (salud del hardware marginal).
+            std::thread::sleep(Duration::from_millis(1500));
+        }
         println!("Video capture thread stopped");
+    }
+
+    /// Espera a que la capturadora reaparezca en AVFoundation tras un
+    /// replug, SIN abrirla (solo verla en el mapa — barato).
+    ///
+    /// Matching tolerante a que CAMBIE el uniqueID (el prefijo de
+    /// locationID depende del puerto — visto 0x2000…→0x1340… en
+    /// terreno; el sufijo de serial es el estable): mismo uid, mismo
+    /// sufijo de 8, o mismo nombre en clase Capture. Si reaparece con
+    /// otro uid, lo guarda en `rebound_uid` para que open_camera use el
+    /// fresco (y lo limpia si volvió al uid original).
+    fn wait_device_back(&self) {
+        let orig_uid = match &self.device {
+            CameraIndex::String(s) => Some(s.clone()),
+            _ => None,
+        };
+        let want_name = self.device_name.lock().unwrap().clone();
+        let suffix: Option<String> = orig_uid
+            .as_ref()
+            .filter(|u| u.len() >= 8)
+            .map(|u| u.chars().rev().take(8).collect());
+        while self.running.load(Ordering::Relaxed) {
+            let hit = devices::video_device_map().into_iter().find(|e| {
+                if matches!(
+                    e.class,
+                    devices::DeviceClass::Webcam | devices::DeviceClass::Virtual
+                ) {
+                    return false; // veda anti-webcam también acá
+                }
+                if let Some(uid) = &orig_uid {
+                    if &e.uid == uid {
+                        return true;
+                    }
+                }
+                if let Some(sfx) = &suffix {
+                    let tail: String = e.uid.chars().rev().take(8).collect();
+                    if sfx == &tail {
+                        return true;
+                    }
+                }
+                // por nombre solo en clase Capture (Unknown + nombre
+                // genérico podría matchear cualquier cosa)
+                if e.class == devices::DeviceClass::Capture {
+                    if let Some(name) = &want_name {
+                        if e.name.starts_with(name.as_str()) || name.starts_with(&e.name) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+            match hit {
+                Some(entry) => {
+                    if let Some(orig) = &orig_uid {
+                        if entry.uid == *orig {
+                            *self.rebound_uid.lock().unwrap() = None;
+                        } else {
+                            println!(
+                                "[camera] device reapareció con OTRO uniqueID ({} → {}) — usando el nuevo",
+                                orig, entry.uid
+                            );
+                            *self.rebound_uid.lock().unwrap() = Some(entry.uid.clone());
+                        }
+                    }
+                    return;
+                }
+                None => std::thread::sleep(Duration::from_millis(1000)),
+            }
+        }
     }
 
     pub fn stop(&self) {
@@ -644,6 +907,11 @@ impl VideoCapture {
             let _ = handle.join();
         }
         println!("Video capture stopped");
+    }
+
+    /// ¿Está el stream de video caído (esperando reconexión del USB)?
+    pub fn is_signal_lost(&self) -> bool {
+        self.signal_lost.load(Ordering::Relaxed)
     }
 
     /// El frame más reciente disponible (copia barata: clon de Arc).

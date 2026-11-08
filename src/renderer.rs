@@ -521,6 +521,31 @@ impl eframe::App for RendererApp {
             self.draw_overlay(&painter);
         }
 
+        // Caída de señal (unplug USB): el supervisor de captura marcó
+        // signal_lost — cartel sobre el último frame. El heartbeat
+        // (100ms) mantiene el loop vivo para mostrarlo aunque no
+        // lleguen frames; al reconectar, el cartel desaparece solo.
+        if self.video.is_signal_lost() {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("no-signal"),
+            ));
+            let galley = painter.layout_no_wrap(
+                "SIN SEÑAL — esperando reconexión del USB…".into(),
+                FontId::proportional(20.0),
+                Color32::WHITE,
+            );
+            let screen = ctx.screen_rect();
+            let size = galley.size() + vec2(24.0, 14.0);
+            let rect = Rect::from_center_size(screen.center(), size);
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(110, 20, 20));
+            let pos = pos2(
+                rect.left() + 12.0,
+                rect.center().y - galley.size().y / 2.0,
+            );
+            painter.galley(pos, galley, Color32::WHITE);
+        }
+
         self.pull_frame();
         if self.health.due() {
             // tomar los deltas SOLO al reportar (antes se drenaban por

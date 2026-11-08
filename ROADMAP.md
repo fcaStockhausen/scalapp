@@ -160,3 +160,22 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   display sin slots para 120 pedidos/s) pintado bimodal 5.5-7.9/25-28ms
   = judder. Pendiente de validación foreground: si con el loop a ~60 el
   pintado queda limpio en TODAS las ventanas, el judder muere acá.
+- **Recovery de unplug USB (7/11)**: nokhwa/AVFoundation NO reporta la
+  desconexión — `frame()` es un `flume recv()` SIN timeout: al caer el
+  USB el thread de captura quedaba colgado DENTRO de nokhwa para siempre
+  (ni Err; freeze del último frame). Fix arquitectural en video.rs:
+  **supervisor + puller**. El puller posee la cámara (si se cuelga,
+  queda detached — leak documentado de un thread por caída); el
+  supervisor vigila actividad (stall > 3s, `SCALAPP_VIDEO_STALL_MS`) o
+  errores sostenidos (150), marca `signal_lost` (cartel "SIN SEÑAL"
+  del renderer sobre el último frame, impulsado por el heartbeat),
+  espera a que el device reaparezca y REABRE con toda la cadena de
+  siempre. Detalle de terreno crítico: **el uniqueID de AVFoundation
+  cambia de puerto a puerto** (0x2000…→0x1340…; el sufijo de serial
+  `345f2131` es el estable) → la espera matchea por uid exacto, sufijo
+  de 8 o nombre (clase Capture; veda anti-webcam activa también ahí) y
+  guarda el uid fresco en `rebound_uid` para el reopen. Arranque
+  inicial fallado = comportamiento histórico (error limpio y exit);
+  fallo de REconexión (p.ej. Discord toma el device al reaparecer) =
+  reintento indefinido con el settle de 1.5s (no martillar la MS2131).
+  El audio ya se autorecupera solo (watchdog → rebuild cada 2s).
