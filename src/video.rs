@@ -487,6 +487,28 @@ impl VideoCapture {
                         mode.frame_rate(),
                         mode.format()
                     );
+                    // PORQUÉ del fallback (episodio 7/11): si el device
+                    // se linkeó a USB2, su lista de modos directamente
+                    // no tiene 1080p60 — avisar causa y remedio
+                    if let Some(entry) = devices::video_device_map()
+                        .into_iter()
+                        .find(|e| e.uid == uid)
+                    {
+                        if entry.name.to_lowercase().contains("usb2") {
+                            println!(
+                                "⚠ '{}' = linkeada a USB2: {}x{}@{} necesita puerto/cable USB3",
+                                entry.name, self.width, self.height, self.fps
+                            );
+                        }
+                    }
+                    let ar = f64::from(mode.resolution().width_x) / f64::from(mode.resolution().height_y);
+                    let want_ar = f64::from(self.width) / f64::from(self.height);
+                    if (ar - want_ar).abs() > 0.02 {
+                        println!(
+                            "⚠ sin modos {:.2}:1 disponibles — usando {:.2}:1 (la imagen se verá con barras o estirada)",
+                            want_ar, ar
+                        );
+                    }
                 }
                 if let Ok(camera) = devices::try_camera_new_retry(
                     device.clone(),

@@ -250,6 +250,12 @@ struct Args {
 
     #[arg(long = "video-fps", default_value_t = 60)]
     video_fps: u32,
+
+    /// Dump de la lista de modos UVC (todas las entradas + resumen
+    /// pedible) y sale. Target: uniqueID, índice, o nada para
+    /// auto-elegir la capturadora.
+    #[arg(long = "dump-modes", value_name = "UID|INDEX")]
+    dump_modes: Option<Option<String>>,
 }
 
 /// Default: audio-only. `--video` o `--video-device` activan el modo A/V.
@@ -638,6 +644,11 @@ fn main() {
 
     if args.list_devices {
         devices::list_devices();
+        return;
+    }
+
+    if let Some(target) = &args.dump_modes {
+        devices::dump_video_modes(target.as_deref());
         return;
     }
 

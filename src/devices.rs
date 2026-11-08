@@ -269,8 +269,85 @@ fn query_devices_full() -> Vec<(u32, String, String)> {
 ///
 /// Scoring si no hay exacto: fps más cercano primero, luego área
 /// (monitoreo: fluidez > tamaño).
-pub fn best_mode_for_device(uid: &str, want: (u32, u32, u32)) -> Option<CameraFormat> {
-    let device =
+/// Dump completo de la lista de modos UVC de un device: TODAS las
+/// entradas crudas (duplicados incluidos — evidencia del bug del
+/// binding) + el resumen "última por dimensión" que usa
+/// best_mode_for_device. No abre el device: solo lee la lista de
+/// formatos de AVFoundation (seguro aunque otro proceso lo tenga).
+/// `target`: uniqueID, índice, o None → caché/primera capturadora.
+pub fn dump_video_modes(target: Option<&str>) {
+    let index: CameraIndex = match target {
+        Some(t) => match t.parse::<u32>() {
+            Ok(i) => CameraIndex::Index(i),
+            Err(_) => CameraIndex::String(t.to_string()),
+        },
+        None => {
+            let pick = cached_device_uid().or_else(|| {
+                video_device_map()
+                    .into_iter()
+                    .find(|e| e.class == DeviceClass::Capture)
+                    .map(|e| e.uid)
+            });
+            match pick {
+                Some(uid) => CameraIndex::String(uid),
+                None => {
+                    println!("--dump-modes: no hay capturadora conocida (pasá uid o índice)");
+                    return;
+                }
+            }
+        }
+    };
+    println!("Dump de modos UVC para {:?}:", index);
+    let device = match nokhwa_bindings_macos::AVCaptureDevice::new(&index) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("no se pudo enumerar: {e}");
+            return;
+        }
+    };
+    println!("Device: {}", device.info().human_name());
+    let formats = match device.supported_formats() {
+        Ok(f) => f,
+        Err(e) => {
+            println!("supported_formats falló: {e}");
+            return;
+        }
+    };
+    println!("— entradas crudas: {}", formats.len());
+    for (i, f) in formats.iter().enumerate() {
+        println!(
+            "  [{i:02}] {}x{} @{} {:?}",
+            f.resolution().width_x,
+            f.resolution().height_y,
+            f.frame_rate(),
+            f.format()
+        );
+    }
+    // resumen "última por dimensión" (el blindaje del bug de duplicados
+    // asimétricos del binding — solo estos modos son seguros de pedir)
+    let mut last_by_dims: Vec<CameraFormat> = Vec::new();
+    for f in &formats {
+        match last_by_dims
+            .iter_mut()
+            .find(|e| e.resolution() == f.resolution())
+        {
+            Some(slot) => *slot = *f,
+            None => last_by_dims.push(*f),
+        }
+    }
+    println!("— última-entrada-por-dimensión (pedibles): {}", last_by_dims.len());
+    for f in &last_by_dims {
+        println!(
+            "  {}x{} @{} {:?}",
+            f.resolution().width_x,
+            f.resolution().height_y,
+            f.frame_rate(),
+            f.format()
+        );
+    }
+}
+
+pub fn best_mode_for_device(uid: &str, want: (u32, u32, u32)) -> Option<CameraFormat> {    let device =
         nokhwa_bindings_macos::AVCaptureDevice::new(&CameraIndex::String(uid.to_string())).ok()?;
     let entries: Vec<CameraFormat> = device
         .supported_formats()
@@ -299,13 +376,59 @@ pub fn best_mode_for_device(uid: &str, want: (u32, u32, u32)) -> Option<CameraFo
     }) {
         return Some(*exact);
     }
-    let want_area = (want.0 as i64) * (want.1 as i64);
-    last_by_dims.sort_by_key(|f| {
-        let area = (f.resolution().width_x as i64) * (f.resolution().height_y as i64);
-        let fps_diff = (f.frame_rate() as i64 - want.2 as i64).abs();
-        (fps_diff, (area - want_area).abs())
+    Some(pick_fallback(&last_by_dims, want))
+}
+
+/// Elección de fallback cuando el modo exacto no existe en la lista
+/// real del device (lección del episodio USB2: la lista sin 1080p60
+/// elegía 800x600 — un 4:3 que deforma una fuente 16:9).
+///
+/// Prioridad (la fuente se ve mejor en el MISMO aspect — el chip
+/// escala la entrada al modo negociado):
+///   1) mismo aspect que `want` y mismo fps → mayor área (sin pasarse
+///      del área pedida; si todo se pasa, la mayor)
+///   2) mismo fps → mayor área bajo el mismo criterio
+///   3) mismo aspect, cualquier fps → mayor área
+///   4) histórico: el más cercano en (diferencia de fps, |área−want|)
+fn pick_fallback(cands: &[CameraFormat], want: (u32, u32, u32)) -> CameraFormat {
+    let want_area = i64::from(want.0) * i64::from(want.1);
+    let area = |f: &CameraFormat| i64::from(f.resolution().width_x) * i64::from(f.resolution().height_y);
+    let want_ar = f64::from(want.0) / f64::from(want.1);
+    let same_ar = |f: &CameraFormat| {
+        let ar = f64::from(f.resolution().width_x) / f64::from(f.resolution().height_y);
+        (ar - want_ar).abs() < 0.02
+    };
+    // la mayor área sin pasarse de want; si TODAS se pasan, la mayor
+    let pick_largest = |pool: Vec<&CameraFormat>| -> Option<CameraFormat> {
+        let mut best_le: Option<&CameraFormat> = None;
+        let mut best_any: Option<&CameraFormat> = None;
+        for c in pool {
+            if area(c) <= want_area && best_le.map_or(true, |b| area(c) > area(b)) {
+                best_le = Some(c);
+            }
+            if best_any.map_or(true, |b| area(c) > area(b)) {
+                best_any = Some(c);
+            }
+        }
+        best_le.or(best_any).copied()
+    };
+
+    let at_fps: Vec<&CameraFormat> = cands.iter().filter(|f| f.frame_rate() == want.2).collect();
+    if let Some(best) = pick_largest(at_fps.iter().copied().filter(|f| same_ar(f)).collect()) {
+        return best;
+    }
+    if let Some(best) = pick_largest(at_fps) {
+        return best;
+    }
+    if let Some(best) = pick_largest(cands.iter().filter(|f| same_ar(f)).collect()) {
+        return best;
+    }
+    let mut sorted: Vec<CameraFormat> = cands.to_vec();
+    sorted.sort_by_key(|f| {
+        let fps_diff = (f.frame_rate() as i64 - i64::from(want.2)).abs();
+        (fps_diff, (area(f) - want_area).abs())
     });
-    last_by_dims.first().copied()
+    sorted[0]
 }
 
 /// Clasificación de dispositivos de video: la heurística anti-webcam.
@@ -596,5 +719,67 @@ pub fn resolve_output_device_by_name(fragment: &str) -> Result<Device> {
             }
             bail!("{n} coincidencias — se más específico")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_fallback;
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa_core::types::CameraFormat;
+
+    fn fmt(w: u32, h: u32, fps: u32) -> CameraFormat {
+        CameraFormat::new_from(w, h, nokhwa_core::types::FrameFormat::YUYV, fps)
+    }
+
+    #[test]
+    fn fallback_prefiere_mismo_aspect_a_area() {
+        // episodio USB2: sin 1080p60, la lista tenía 4:3 hasta 800x600 y
+        // 16:9 menores — el 16:9 debe ganar aunque el 4:3 sea más grande
+        let cands = [fmt(800, 600, 60), fmt(1280, 720, 60), fmt(1024, 768, 60)];
+        let pick = pick_fallback(&cands, (1920, 1080, 60));
+        assert_eq!((pick.resolution().width_x, pick.resolution().height_y), (1280, 720));
+    }
+
+    #[test]
+    fn fallback_sin_mismo_aspect_toma_mayor_area_al_fps() {
+        let cands = [fmt(640, 480, 60), fmt(800, 600, 60), fmt(1024, 768, 60)];
+        let pick = pick_fallback(&cands, (1920, 1080, 60));
+        assert_eq!((pick.resolution().width_x, pick.resolution().height_y), (1024, 768));
+    }
+
+    #[test]
+    fn fallback_fps_gana_a_aspect() {
+        // decisión de diseño: FLUIDEZ primero (prioridad del proyecto:
+        // 60fps antes que calidad). Sin 1080p60, un 4:3@60 le gana a un
+        // 16:9@30 — y open_camera avisa del aspecto distinto.
+        let cands = [fmt(800, 600, 60), fmt(1920, 1080, 30)];
+        let pick = pick_fallback(&cands, (1920, 1080, 60));
+        assert_eq!((pick.resolution().width_x, pick.resolution().height_y), (800, 600));
+        assert_eq!(pick.frame_rate(), 60);
+    }
+
+    #[test]
+    fn fallback_no_se_pasa_del_area_pedida() {
+        // si hay un modo mayor que el pedido, prefiere el mayor que NO
+        // se pasa (menos bandwidth para la misma imagen escalada)
+        let cands = [fmt(2560, 1440, 60), fmt(1280, 720, 60)];
+        let pick = pick_fallback(&cands, (1920, 1080, 60));
+        assert_eq!((pick.resolution().width_x, pick.resolution().height_y), (1280, 720));
+    }
+
+    #[test]
+    fn fallback_todo_gigante_toma_el_mayor() {
+        let cands = [fmt(2560, 1440, 30), fmt(1920, 1080, 30)];
+        let pick = pick_fallback(&cands, (1280, 720, 60));
+        assert_eq!((pick.resolution().width_x, pick.resolution().height_y), (2560, 1440));
+    }
+
+    #[test]
+    fn fallback_historico_cuando_no_hay_coincidencia() {
+        // sin mismo aspect ni fps: el histórico (fps más cercano)
+        let cands = [fmt(800, 600, 30), fmt(640, 480, 50)];
+        let pick = pick_fallback(&cands, (1920, 1080, 60));
+        assert_eq!(pick.frame_rate(), 50);
     }
 }

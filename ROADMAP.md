@@ -179,3 +179,21 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   fallo de REconexión (p.ej. Discord toma el device al reaparecer) =
   reintento indefinido con el settle de 1.5s (no martillar la MS2131).
   El audio ya se autorecupera solo (watchdog → rebuild cada 2s).
+- **Episodio USB2 (8/11) + selección flexible**: tras un replug la
+  capturadora quedó linkeada a USB2 (se renombra "USB2 Video"/"USB2
+  Digital Audio" — el firmware expone OTRA lista de modos, sin
+  1080p60) y la app cayó a 800x600@60 (4:3 → imagen "rara"). El
+  fallback por "área más cercana" elegía sin mirar el ASPECTO de la
+  fuente. Fixes: `pick_fallback` consciente de aspecto (mismo AR y
+  fps → mismo fps → mismo AR → histórico; decisión documentada: FPS
+  gana a aspecto porque la prioridad del proyecto es fluidez),
+  aviso explícito "linkeada a USB2 — necesita puerto/cable USB3" y
+  aviso de aspecto distinto al pedido. Nuevo flag `--dump-modes` (lista
+  UVC completa cruda + resumen pedible — no abre el device, seguro con
+  Discord tomándolo). NUEVO DATO: en USB3 la lista es FIJA (116
+  entradas, 640x480@10 hasta 2560x1440@30, todo duplicado — el bug del
+  binding) e independiente de la resolución de entrada: la MS2131
+  ESCALA la entrada al modo negociado, así que una fuente que cambia a
+  1200x800 mid-stream sigue entregando sin renegociar (y si el HDMI
+  cae >3s en el switch, el supervisor reconecta y re-elige de la lista
+  fresca).
