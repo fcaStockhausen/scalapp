@@ -269,6 +269,23 @@ fn query_devices_full() -> Vec<(u32, String, String)> {
 ///
 /// Scoring si no hay exacto: fps más cercano primero, luego área
 /// (monitoreo: fluidez > tamaño).
+/// ¿Existe el combo EXACTO (w,h,fps) YUYV en la lista REAL del device?
+/// Mira TODOS los duplicados — no solo el "último por dimensión".
+/// Con el binding vendoreado y parcheado (set_all matchea el par
+/// formato+rango atómicamente) pedir cualquiera de los duplicados es
+/// seguro: así pide fps nativas OBS (activeVideoMinFrameDuration).
+pub fn exact_mode_in_raw_list(uid: &str, want: (u32, u32, u32)) -> Option<CameraFormat> {
+    let device =
+        nokhwa_bindings_macos::AVCaptureDevice::new(&CameraIndex::String(uid.to_string())).ok()?;
+    let formats = device.supported_formats().ok()?;
+    formats.into_iter().find(|f| {
+        f.format() == FrameFormat::YUYV
+            && f.resolution().width_x == want.0
+            && f.resolution().height_y == want.1
+            && f.frame_rate() == want.2
+    })
+}
+
 /// Dump completo de la lista de modos UVC de un device: TODAS las
 /// entradas crudas (duplicados incluidos — evidencia del bug del
 /// binding) + el resumen "última por dimensión" que usa

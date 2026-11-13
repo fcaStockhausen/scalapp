@@ -438,14 +438,17 @@ impl VideoCapture {
 
     /// Abre la cámara pidiendo un modo que EXISTE en el device.
     ///
-    /// 1. Pre-validación por AVFoundation (sin HID): leer la lista real de
+    /// 1. NATIVO exacto (binding vendoreado arreglado): si la lista REAL
+    ///    tiene (w,h,fps) YUYV en cualquier duplicado, se pide directo —
+    ///    así llega 1080p30/50 nativo (set_all matchea el par
+    ///    formato+rango atómicamente y el readback ya no miente).
+    /// 2. Pre-validación por AVFoundation (sin HID): leer la lista real de
     ///    modos por uniqueID y elegir el mejor (exacto si hay; si no —
-    ///    USB2 — el más cercano). Pedir solo modos reales evita el bug del
-    ///    binding: set_all lanza NSException con modos fantasma y deja el
-    ///    device lockeado dentro del proceso.
-    /// 2. Cadena legacy blindada (Index explícito o sin lista):
+    ///    USB2 — el más cercano consciente de aspecto/fps).
+    /// 3. Cadena legacy blindada (Index explícito o sin lista):
     ///    Exact → escaneo → Closest YUYV → Closest MJPEG, todo bajo
-    ///    catch_unwind.
+    ///    catch_unwind (cinturón y tirantes: el binding ya está arreglado,
+    ///    pero el armor quedó).
     fn open_camera(&self) -> Result<Camera, String> {
         // Reconnect: si el device reapareció con OTRO uniqueID (cambio
         // de puerto/ubicación USB), usar el uid fresco del supervisor.
@@ -492,6 +495,29 @@ impl VideoCapture {
                 .map(|info| info.misc().to_string()),
         };
         if let Some(uid) = uid {
+            // NATIVO por fps (binding vendoreado arreglado): si la lista
+            // REAL tiene el combo exacto (w,h,fps) YUYV — aunque esté en
+            // un duplicado no-último — pedirlo directo. Es lo que hace
+            // OBS (activeVideoMinFrameDuration con la fps elegida).
+            if let Some(exact) =
+                devices::exact_mode_in_raw_list(&uid, (self.width, self.height, self.fps))
+            {
+                println!(
+                    "Pre-validated exact native {}x{}@{} {:?}",
+                    exact.resolution().width_x,
+                    exact.resolution().height_y,
+                    exact.frame_rate(),
+                    exact.format()
+                );
+                if let Ok(camera) = devices::try_camera_new_retry(
+                    device.clone(),
+                    RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact)),
+                    3,
+                ) {
+                    return Ok(camera);
+                }
+                println!("native exact open failed — falling back to best dedup mode");
+            }
             if let Some(mode) =
                 devices::best_mode_for_device(&uid, (self.width, self.height, self.fps))
             {
@@ -994,8 +1020,8 @@ impl VideoCapture {
         self.fps_cap.store(cap, Ordering::Relaxed);
         if cap > 0 {
             println!(
-                "✓ Presentación a {cap}fps (--30): device a su mejor tasa, \
-                 se saltean frames antes de decodificar (menos CPU/GPU)"
+                "✓ Presentación a {cap}fps: si el device entregara más, se \
+                 saltean frames antes de decodificar (menos CPU/GPU)"
             );
         }
     }

@@ -23,3 +23,11 @@ ctrlc = "3"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Binding de AVFoundation vendoreado con el fix de set_all para los
+# duplicados asimétricos de la MS2131 (ver vendor/nokhwa-bindings-macos/
+# src/lib.rs, fn set_all). Sin esto, pedir una fps que solo uno de los
+# dos descriptores soporta → NSException + device lockeado en el
+# proceso (la causa original de la veda "última-por-dimensión").
+[patch.crates-io]
+nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }

@@ -179,6 +179,31 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   fallo de REconexión (p.ej. Discord toma el device al reaparecer) =
   reintento indefinido con el settle de 1.5s (no martillar la MS2131).
   El audio ya se autorecupera solo (watchdog → rebuild cada 2s).
+- **Bug del binding nokhwa ARREGLADO — fps nativas (13/11)**: el usuario
+  reportó que OBS a 1080p30 se ve notablemente mejor y pidió investigar.
+  La causa era DOBLE, ambas en nokhwa-bindings-macos 0.2.4:
+  1. `set_all` desempataba MAL los duplicados asimétricos de la MS2131:
+     pisaba `selected_format` con cada duplicado de la dimensión
+     mientras `selected_range` podía quedar de otro → formato activo sin
+     esa fps → NSException en setValue:activeVideoMinFrameDuration, con
+     el device aún lockeado (crash + "Lock Rejected" eterno — la causa
+     de la veda "última-por-dimensiones").
+  2. `active_format` NO leía `activeVideoMinFrameDuration`: devolvía
+     SIEMPRE la fps MÁXIMA del formato (con un "FIXME: what the fuck?"
+     del autor). Nokhwa's open_stream() refresca el formato "activo"
+     (que mentía 60) y lo RE-APLICA con set_all — por eso todo pedido
+     de 30/50 volvía como 60: "la MS2131 solo da 60" era el readback
+     mintiendo. Fix: leer CMTime real por msg_send (struct repr(C) con
+     Encode manual "{CMTime=qiqIq}", sin NSValue/autorelease).
+  El binding quedó VENDOREADO en vendor/nokhwa-bindings-macos con ambos
+  fixes + diagnóstico por stderr en set_all ([patch.crates-io]).
+  Resultado: `--video-fps 30`/`--30` ahora abren NATIVO
+  ("Camera setup @ 30.00", DEV p50 33.3 = diezmado del CHIP como OBS),
+  CPU 19% (vs 25 diezmado, 39 a 60), WindowServer 21%. Yapa: la primera
+  corrida 60fps post-fix del doble-repaint mostró loop 59.5 (ya no 120)
+  con pintado limpio p10 16.2/p90 17.3. `exact_mode_in_raw_list()`
+  encuentra combos en TODOS los duplicados; catch_unwind quedó como
+  cinturón y tirantes.
 - **`--30` modo económico (13/11)**: presentación a 30fps. Pedirle 30 al
   device NO es seguro (por el bug del binding solo los modos
   "última-por-dimensión" son pedibles — 1080p es @60), así que el
@@ -188,6 +213,10 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   umbrales de ráfaga/hueco del pacing ahora escalan con el intervalo
   esperado (antes fijos 8/25ms calibrados a 60fps — a 33.3ms normal
   marcaba +450 "huecos" falsos por ventana).
+  **ACTUALIZACIÓN (mismo día): el bug del binding quedó ARREGLADO —
+  ver la entrada anterior. `--30`/`--video-fps N` ahora piden fps
+  NATIVAS al device (CPU 19%); el diezmado quedó como red de seguridad
+  para modos que el device no tenga.**
 - **Episodio USB2 (8/11) + selección flexible**: tras un replug la
   capturadora quedó linkeada a USB2 (se renombra "USB2 Video"/"USB2
   Digital Audio" — el firmware expone OTRA lista de modos, sin
