@@ -251,6 +251,12 @@ struct Args {
     #[arg(long = "video-fps", default_value_t = 60)]
     video_fps: u32,
 
+    /// Presentación a 30fps (modo económico): el device sigue a su
+    /// mejor tasa pero se saltean frames ANTES de decodificar — mitad
+    /// de CPU/GPU. No renegocia nada con la capturadora.
+    #[arg(long = "30")]
+    fps30: bool,
+
     /// Dump de la lista de modos UVC (todas las entradas + resumen
     /// pedible) y sale. Target: uniqueID, índice, o nada para
     /// auto-elegir la capturadora.
@@ -443,6 +449,13 @@ fn run(args: Args) -> Result<()> {
         // si el usuario fijó --video-device N, respetarlo (sin escaneo)
         capture.set_allow_index_scan(args.video_device.is_none());
         capture.allow_webcam = args.force_webcam;
+        // --30: modo económico. El device sigue streameando a su mejor
+        // tasa (por el bug del binding solo podemos pedir modos
+        // "última-por-dimensión" — 1080p es @60), pero se saltean frames
+        // ANTES de decodizar: mitad de CPU/GPU, cero renegociación.
+        if args.fps30 {
+            capture.set_fps_cap(30);
+        }
         let capture = Arc::new(capture);
         println!(
             "✓ Video capture initialized: {}x{} @ {}fps",

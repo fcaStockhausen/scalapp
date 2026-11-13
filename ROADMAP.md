@@ -179,6 +179,15 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   fallo de REconexión (p.ej. Discord toma el device al reaparecer) =
   reintento indefinido con el settle de 1.5s (no martillar la MS2131).
   El audio ya se autorecupera solo (watchdog → rebuild cada 2s).
+- **`--30` modo económico (13/11)**: presentación a 30fps. Pedirle 30 al
+  device NO es seguro (por el bug del binding solo los modos
+  "última-por-dimensión" son pedibles — 1080p es @60), así que el
+  diezmado es HOST-SIDE: el puller saltea frames ANTES de decodificar
+  (decimate_step), cero renegociación con la capturadora. Medido:
+  CPU 36%→25%, pintado p50 33.3ms sin ráfagas. Ajuste de yapa: los
+  umbrales de ráfaga/hueco del pacing ahora escalan con el intervalo
+  esperado (antes fijos 8/25ms calibrados a 60fps — a 33.3ms normal
+  marcaba +450 "huecos" falsos por ventana).
 - **Episodio USB2 (8/11) + selección flexible**: tras un replug la
   capturadora quedó linkeada a USB2 (se renombra "USB2 Video"/"USB2
   Digital Audio" — el firmware expone OTRA lista de modos, sin

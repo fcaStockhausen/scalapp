@@ -285,10 +285,13 @@ impl RendererApp {
         let paint_now = Instant::now();
         if let Some(prev) = self.last_paint.replace(paint_now) {
             let delta = paint_now.duration_since(prev).as_secs_f32() * 1000.0;
-            if delta < 8.0 {
+            // umbrales relativos al intervalo efectivo (con --30 lo
+            // normal es 33.3ms — no un hueco)
+            let expected = 1000.0 / self.video.display_fps() as f32;
+            if delta < expected * 0.5 {
                 self.paint_bursts += 1;
             }
-            if delta > 25.0 {
+            if delta > expected * 1.5 {
                 self.paint_gaps += 1;
             }
             self.paint_deltas_ms.push(delta);
@@ -576,7 +579,7 @@ impl eframe::App for RendererApp {
                 ),
                 (self.paint_bursts, self.paint_gaps, paint_pct(50)),
                 (paint_pct(10), paint_pct(90)),
-                self.video.fps,
+                self.video.display_fps(),
             );
         }
         self.update_status();

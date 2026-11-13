@@ -3,7 +3,7 @@ use nokhwa::utils::{
     CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
 };
 use nokhwa::Camera;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::devices;
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,10 @@ struct PacingStats {
     bursts: u64,
     gaps: u64,
     deltas: Vec<f32>,
+    /// Intervalo esperado entre frames (ms): los umbrales de
+    /// ráfaga/hueco escalan con él (60fps → 8/25ms; con --30 el
+    /// intervalo normal es 33.3ms y un hueco "real" es >50ms).
+    expected_ms: f32,
 }
 
 impl PacingStats {
@@ -62,16 +66,25 @@ impl PacingStats {
             bursts: 0,
             gaps: 0,
             deltas: Vec::new(),
+            expected_ms: 16.7,
+        }
+    }
+
+    fn set_expected_fps(&mut self, fps: f32) {
+        if fps > 0.0 {
+            self.expected_ms = 1000.0 / fps;
         }
     }
 
     fn record(&mut self, t: f64) {
         if let Some(prev) = self.last.replace(t) {
             let delta_ms = ((t - prev) * 1000.0) as f32;
-            if delta_ms < 8.0 {
+            // umbrales relativos: <0.5× y >1.5× el intervalo esperado
+            // (con 16.7ms reproducen los históricos 8/25ms)
+            if delta_ms < self.expected_ms * 0.5 {
                 self.bursts += 1;
             }
-            if delta_ms > 25.0 {
+            if delta_ms > self.expected_ms * 1.5 {
                 self.gaps += 1;
             }
             self.deltas.push(delta_ms);
@@ -243,6 +256,16 @@ fn decode_yuyv_to_rgba(yuyv: &[u8], red_gain: f32, saturation: f32) -> Vec<u8> {
     out
 }
 
+/// Cuántos frames del device saltar por cada uno presentado (modo
+/// económico --30): step = round(fps_device / cap). cap 0 (sin cap) o
+/// cap ≥ fps del device → 1 (no diezmamos).
+fn decimate_step(cap: u32, device_fps: f32) -> u64 {
+    if cap == 0 || device_fps <= cap as f32 {
+        return 1;
+    }
+    ((device_fps / cap as f32) + 0.5).floor() as u64
+}
+
 /// Reloj de pared en ms (para vigilancia de stall del supervisor entre
 /// sesiones; no se usa para pacing).
 fn now_ms() -> u64 {
@@ -327,6 +350,12 @@ pub struct VideoCapture {
     /// estable). El supervisor guarda acá el uid fresco; open_camera
     /// lo prefiere por sobre el original.
     rebound_uid: Arc<Mutex<Option<String>>>,
+    /// Cap de PRESENTACIÓN (modo económico --30): 0 = sin cap. El
+    /// device streamea a su mejor tasa (pedirle menos fps no es seguro:
+    /// por el bug del binding solo los modos "última-por-dimensión"
+    /// son pedibles, y p.ej. 1080p es @60) — el puller saltea frames
+    /// ANTES de decodificar: decode/textura/presentación a la mitad.
+    fps_cap: Arc<AtomicU32>,
 }
 
 impl VideoCapture {
@@ -351,6 +380,7 @@ impl VideoCapture {
             signal_lost: Arc::new(AtomicBool::new(false)),
             device_name: Arc::new(Mutex::new(None)),
             rebound_uid: Arc::new(Mutex::new(None)),
+            fps_cap: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -621,6 +651,19 @@ impl VideoCapture {
         // nombre para el re-encuentro tras replug (el uniqueID puede
         // cambiar de puerto a puerto; el nombre no)
         *self.device_name.lock().unwrap() = Some(camera.info().human_name().to_string());
+        // umbrales de pacing relativos al intervalo EFECTIVO de
+        // presentación (con --30, 33.3ms es lo normal — no un hueco)
+        {
+            let cap = self.fps_cap.load(Ordering::Relaxed) as f32;
+            let eff = if cap > 0.0 && cap < actual_fps {
+                cap
+            } else {
+                actual_fps
+            };
+            let mut stats = self.stats.lock().unwrap();
+            stats.device_pacing.set_expected_fps(eff);
+            stats.pull_pacing.set_expected_fps(eff);
+        }
         println!(
             "Camera setup: {}x{} @ {actual_fps:.2} FPS (requested exact {}x{}@{} YUYV, device: {})",
             resolution.width_x,
@@ -636,11 +679,21 @@ impl VideoCapture {
         // supervisor decida. El unplug silencioso (hang de recv) lo
         // caza el supervisor por stall.
         let mut errors = 0u32;
+        // diezmado del modo económico: contador de frames del DEVICE
+        let mut device_seq: u64 = 0;
         while self.running.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
             match camera.frame() {
                 Ok(frame_buffer) => {
                     activity.store(now_ms(), Ordering::Relaxed);
                     errors = 0;
+                    // --30: saltear ANTES de decodificar. La actividad
+                    // ya se marcó (el device está vivo aunque saltemos).
+                    device_seq += 1;
+                    let cap = self.fps_cap.load(Ordering::Relaxed);
+                    let step = decimate_step(cap, actual_fps);
+                    if step > 1 && device_seq % step != 0 {
+                        continue;
+                    }
                     // dump crudo para diagnóstico de color (SCALAPP_RAW_DUMP):
                     // guarda N frames YUYV sin decodificar
                     if let Some(path) = &raw_dump {
@@ -936,6 +989,28 @@ impl VideoCapture {
         self.signal_lost.load(Ordering::Relaxed)
     }
 
+    /// Cap de presentación en fps (0 = sin cap, modo --30 = 30).
+    pub fn set_fps_cap(&self, cap: u32) {
+        self.fps_cap.store(cap, Ordering::Relaxed);
+        if cap > 0 {
+            println!(
+                "✓ Presentación a {cap}fps (--30): device a su mejor tasa, \
+                 se saltean frames antes de decodificar (menos CPU/GPU)"
+            );
+        }
+    }
+
+    /// Fps EFECTIVO de presentación (cap si hay, sino el del modo) —
+    /// para targets de diagnóstico y overlays.
+    pub fn display_fps(&self) -> u32 {
+        let cap = self.fps_cap.load(Ordering::Relaxed);
+        if cap > 0 && cap < self.fps {
+            cap
+        } else {
+            self.fps
+        }
+    }
+
     /// El frame más reciente disponible (copia barata: clon de Arc).
     pub fn get_latest_frame(&self) -> Option<Arc<TimestampedFrame>> {
         self.latest.lock().unwrap().clone()
@@ -1069,6 +1144,21 @@ mod tests {
             }
         }
         assert!(comparados > 100, "muy pocos píxeles comparables: {comparados}");
+    }
+
+    #[test]
+    fn decimate_step_modo_economico() {
+        use super::decimate_step;
+        // sin cap o cap ≥ fps del device → no diezmamos
+        assert_eq!(decimate_step(0, 60.0), 1);
+        assert_eq!(decimate_step(60, 60.0), 1);
+        assert_eq!(decimate_step(120, 60.0), 1);
+        // --30 sobre 60 → 1 de cada 2
+        assert_eq!(decimate_step(30, 60.0), 2);
+        // cap 30 sobre 50 → 2 (redondeo)
+        assert_eq!(decimate_step(30, 50.0), 2);
+        // cap 24 sobre 60 → 2.5 → 3 (redondeo a nearest)
+        assert_eq!(decimate_step(24, 60.0), 3);
     }
 
     #[test]
