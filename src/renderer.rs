@@ -159,6 +159,11 @@ pub struct RendererApp {
     /// 1.0/1.0 = neutro. Persiste en ~/.scalapp_color.
     red_gain: f32,
     saturation: f32,
+    /// Mipmaps en la textura de video (tecla M): minificación con
+    /// footprint real en vez de 4 taps bilineares — la diferencia
+    /// contra el canvas 1:1 de OBS cuando la ventana no calza exacto
+    /// en píxeles físicos (Retina 2x, ventana más chica que 1920).
+    mipmaps: bool,
 }
 
 impl RendererApp {
@@ -216,6 +221,7 @@ impl RendererApp {
             next_deadline: None,
             red_gain: 1.0,
             saturation: 1.0,
+            mipmaps: true,
         };
         app.load_color_adjust();
         // empujar el ajuste cargado al thread de captura (ahí se aplica)
@@ -305,6 +311,12 @@ impl RendererApp {
     /// Subida a textura: los frames ya llegan RGBA del thread de captura
     /// (decode YUYV→RGBA en una pasada allá) — aquí solo se copian a la
     /// textura de egui. El loop de UI quedó liviano.
+    ///
+    /// MIPMAPS (tecla M): con la ventana a un tamaño que no calza
+    /// exacto con 1920x1080 FÍSICOS (Retina 2x, ventana chica), la
+    /// minificación bilinear de 4 taps deja bruma/aliasing — los
+    /// mipmaps promedian el footprint real por píxel (el equivalente
+    /// al filtrado de calidad de un compositor de video).
     fn paint_now(&mut self, w: u32, h: u32, data: &[u8]) {
         let w = w as usize;
         let h = h as usize;
@@ -313,7 +325,17 @@ impl RendererApp {
             return;
         }
         let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &data[..expected]);
-        self.texture.set(image, egui::TextureOptions::LINEAR);
+        let options = if self.mipmaps {
+            egui::TextureOptions {
+                magnification: egui::TextureFilter::Linear,
+                minification: egui::TextureFilter::Linear,
+                wrap_mode: egui::TextureWrapMode::ClampToEdge,
+                mipmap_mode: Some(egui::TextureFilter::Linear),
+            }
+        } else {
+            egui::TextureOptions::LINEAR
+        };
+        self.texture.set(image, options);
         self.texture_size = [w, h];
     }
 
@@ -382,6 +404,10 @@ impl RendererApp {
                 "FPS: cap {:.1} | out {:.1} | loop {:.1}",
                 cap_stats.fps_actual, self.painted_fps.fps, self.loop_fps.fps
             ));
+            lines.push(format!(
+                "mipmaps: {} | P = pixel-perfect",
+                if self.mipmaps { "ON (M)" } else { "off (M)" }
+            ));
             if let Some(frame) = self.video.get_latest_frame() {
                 if let Some(age) = self.video.frame_age_secs(&frame) {
                     lines.push(format!("Frame age: {:.1}ms", age * 1000.0));
@@ -418,8 +444,33 @@ impl eframe::App for RendererApp {
         let toggle_f = ctx.input(|i| i.key_pressed(egui::Key::F));
         let toggle_o = ctx.input(|i| i.key_pressed(egui::Key::O));
         let toggle_s = ctx.input(|i| i.key_pressed(egui::Key::S));
+        let toggle_m = ctx.input(|i| i.key_pressed(egui::Key::M));
+        let pixel_perfect = ctx.input(|i| i.key_pressed(egui::Key::P));
         let quit_q = ctx.input(|i| i.key_pressed(egui::Key::Q));
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        if toggle_m {
+            self.mipmaps = !self.mipmaps;
+            println!(
+                "[render] mipmaps {}",
+                if self.mipmaps { "ON" } else { "off" }
+            );
+        }
+        if pixel_perfect {
+            // PIXEL-PERFECT (tecla P): ventana del tamaño exacto para
+            // 1 texel = 1 píxel FÍSICO del video — el equivalente al
+            // canvas 1:1 de OBS. Con borderless (F) calza clavado.
+            let [tw, th] = self.texture_size;
+            if tw > 1 {
+                let ppp = ctx.pixels_per_point();
+                let w = tw as f32 / ppp;
+                let h = th as f32 / ppp;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(w, h)));
+                println!(
+                    "[render] pixel-perfect: ventana {w:.0}x{h:.0}pt = {tw}x{th}px físicos (1:1)"
+                );
+            }
+        }
 
         if toggle_o {
             self.show_overlay = !self.show_overlay;
