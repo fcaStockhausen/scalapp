@@ -212,6 +212,11 @@ struct Args {
     #[arg(long = "hpf", default_value_t = 0)]
     hpf: u32,
 
+    /// Frecuencias de notch manuales ("59.5,60.5"): el acople video→audio
+    /// del chip cambia con el modo — re-medir con tools/audio_diag.py.
+    #[arg(long = "notch-hum-at", value_name = "F,F,...")]
+    notch_hum_at: Option<String>,
+
     /// Iniciar con ventana borderless: SIN barra de título ni bordes (no
     /// es fullscreen — la ventana conserva tamaño y posición). Igual que
     /// presionar F; F/Esc la devuelven a ventana normal.
@@ -353,6 +358,20 @@ fn run(args: Args) -> Result<()> {
     }
     audio_capture.set_notch_hum(!args.no_notch_hum);
     audio_capture.set_hpf(args.hpf);
+    if let Some(spec) = &args.notch_hum_at {
+        // "--notch-hum-at 59.5,60.5" — frecuencias medidas con
+        // tools/audio_diag.py cuando el acople se muda de modo
+        let freqs: Vec<f32> = spec
+            .split(',')
+            .filter_map(|t| t.trim().parse::<f32>().ok())
+            .filter(|f| *f > 0.0 && *f < 20000.0)
+            .collect();
+        if !freqs.is_empty() {
+            audio_capture.set_notch_override(freqs);
+        } else {
+            println!("⚠ --notch-hum-at sin frecuencias válidas — ignorado");
+        }
+    }
     println!(
         "✓ Audio capture initialized: {}Hz, {} channels",
         args.audio_rate, 2

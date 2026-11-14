@@ -124,13 +124,46 @@ impl NotchBank {
         }
     }
 
-    /// Notches quirúrgicos del hum: 60.06/120.12/180.18 Hz (medidos con
-    /// resolución 0.09Hz — el tono es crystal-estable) a Q=25: banda -3dB
-    /// de ±1.2Hz en 60 → B1 (61.7Hz) queda a -1.8dB, B2 (123.5Hz) a
-    /// -1.8dB — el contenido del juego sobrevive. (Q=12 costaba -5dB en
-    /// esos tonos: mala compra contra deriva que no existe.)
+    /// Notches quirúrgicos del hum (medidos, crystal-estables):
+    /// - 29/10: tono a 60.06 + armónicos 120.12/180.18.
+    /// - 14/11 (thump "tum tum" ~1Hz): el acople en 1080p60 nativo es un
+    ///   PAR de tonos 59.5/60.5 (18/18 ventanas estables, diagnostico
+    ///   con tools/audio_diag.py) que BATE a ~1Hz — dos inaudibles que
+    ///   se suman/cancelan una vez por segundo. Sus 2º armónicos
+    ///   119.0/121.0 por las dudas.
+    /// Q: 25 para la terna histórica; 100 para el par (estabilidad
+    /// medida ±0.1Hz en 146s → Q alto seguro): media banda -3dB de
+    /// ±0.3Hz → Bb1 (58.3Hz) y B1 (61.7Hz) intactos.
     pub fn hum_notches(sample_rate: u32) -> Self {
-        Self::new(sample_rate, &[60.06, 120.12, 180.18], 25.0)
+        let mut bank = Self::new(sample_rate, &[], 1.0);
+        for (f0, q) in [
+            (60.06f32, 25.0),
+            (120.12, 25.0),
+            (180.18, 25.0),
+            (59.5, 100.0),
+            (60.5, 100.0),
+            (119.0, 100.0),
+            (121.0, 100.0),
+        ] {
+            bank.push_notch(f0, q);
+        }
+        bank
+    }
+
+    /// Agrega un notch con Q propio (los tonos de acople del chip son
+    /// cristal-estables: Q alto = más quirúrgico sin riesgo).
+    pub fn push_notch(&mut self, f0: f32, q: f32) {
+        let w0 = 2.0 * std::f32::consts::PI * f0 / self.fs;
+        let alpha = w0.sin() / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        self.coeffs.push(NotchCoeffs {
+            b0: 1.0 / a0,
+            b1: (-2.0 * w0.cos()) / a0,
+            b2: 1.0 / a0,
+            a1: (-2.0 * w0.cos()) / a0,
+            a2: (1.0 - alpha) / a0,
+        });
+        self.states.push([[0.0f32; 2]; 2]);
     }
 
     /// Agrega un high-pass 4º orden (2 biquads cascados). Opt-in via
@@ -296,6 +329,7 @@ impl AudioPlayback {
         cushion_ms: Arc<AtomicU64>,
         notch_hum: bool,
         hpf_hz: u32,
+        notch_override: Option<Vec<f32>>,
     ) -> Result<Stream> {
         // tope de seguridad por tiempo (~0.75s) — con deriva compensada
         // la cola vive cerca del objetivo, no del tope
@@ -366,7 +400,9 @@ impl AudioPlayback {
         // Filtro anti-hum (opt-in) + grabador de SALIDA para validación
         // (SCALAPP_REC_OUT, post-filtro).
         let notch_out = (notch_hum || hpf_hz > 0).then(|| {
-            let mut bank = if notch_hum {
+            let mut bank = if let Some(freqs) = &notch_override {
+                NotchBank::new(sample_rate, freqs, 25.0)
+            } else if notch_hum {
                 NotchBank::hum_notches(sample_rate)
             } else {
                 NotchBank::new(sample_rate, &[], 1.0)
@@ -392,8 +428,19 @@ impl AudioPlayback {
             "Audio playback device: {}",
             device.name().unwrap_or_else(|_| "?".into())
         );
-        if notch_hum {
-            println!("✓ Notch anti-hum activo: 60.06/120.12/180.18 Hz (Q=25, quirúrgico)");
+        if let Some(freqs) = &notch_override {
+            println!(
+                "✓ Notch anti-hum OVERRIDE: {} Hz (Q=25, quirúrgico)",
+                freqs
+                    .iter()
+                    .map(|f| format!("{f:.2}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            );
+        } else if notch_hum {
+            println!(
+                "✓ Notch anti-hum activo: 59.5/60.06/60.5/119/120.12/121/180.18 Hz (Q=25, quirúrgico) — par 59.5/60.5 = batido ~1Hz (thump 14/11)"
+            );
         }
         if hpf_hz > 0 {
             println!("✓ High-pass {hpf_hz}Hz activo (ojo: atenúa el sub-bajo del contenido)");
@@ -608,6 +655,8 @@ pub struct AudioCapture {
     /// High-pass opcional en Hz (0 = off). Mata el rumor 28-38Hz del
     /// chip, también el sub-bajo del contenido — decisión del usuario.
     hpf_hz: AtomicU32,
+    /// Override de frecuencias de notch (--notch-hum-at).
+    notch_override: std::sync::Mutex<Option<Vec<f32>>>,
 }
 
 impl AudioCapture {
@@ -641,6 +690,7 @@ impl AudioCapture {
             cushion_base_ms: AtomicU64::new(0),
             notch_hum: std::sync::atomic::AtomicBool::new(false),
             hpf_hz: AtomicU32::new(0),
+            notch_override: std::sync::Mutex::new(None),
         }
     }
 
@@ -652,6 +702,14 @@ impl AudioCapture {
     /// Activa el notch del hum (--notch-hum).
     pub fn set_notch_hum(&self, on: bool) {
         self.notch_hum.store(on, Ordering::Relaxed);
+    }
+
+    /// Override de frecuencias de notch (--notch-hum-at "59.5,60.5"):
+    /// el acople video→audio del chip SE MUDA de frecuencia al cambiar
+    /// de modo (29/10: 60.06 solo; 14/11 en 1080p60 nativo: par
+    /// 59.5/60.5). Re-medir con tools/audio_diag.py y fijar acá.
+    pub fn set_notch_override(&self, freqs: Vec<f32>) {
+        *self.notch_override.lock().unwrap() = Some(freqs);
     }
 
     /// High-pass opcional (--hpf, 0 = off).
@@ -851,6 +909,7 @@ impl AudioCapture {
                 cushion_ms.clone(),
                 self.notch_hum.load(Ordering::Relaxed),
                 self.hpf_hz.load(Ordering::Relaxed),
+                self.notch_override.lock().unwrap().clone(),
             ) {
                 Ok(out_stream) => {
                     *self.playback.lock().unwrap() = Some(playback);
@@ -1052,7 +1111,7 @@ mod tests {
         // matarlos SIN tocar notas reales del contenido.
         let fs = 48000u32;
         let mut bank = NotchBank::hum_notches(fs);
-        let n = fs as usize; // 1s
+        let n = fs as usize * 3; // 3s: los notches Q=100 tardan ~0.5s en asentarse
         let sine = |f: f32, t: usize| (2.0 * std::f32::consts::PI * f * t as f32 / fs as f32).sin();
         let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
         // buffer INTERLEAVED estéreo (canal L y R con la misma señal):
@@ -1072,11 +1131,18 @@ mod tests {
             let a = atten_db(&mut bank, f0);
             assert!(a > 20.0, "hum {f0}Hz: solo {a:.1}dB");
         }
+        // el PAR del batido (thump 14/11, 1080p60 nativo): dos tonos
+        // ~1Hz aparte batiendo = "tum tum" — ambos deben caer solos
+        for f0 in [59.5f32, 60.5, 119.0, 121.0] {
+            let a = atten_db(&mut bank, f0);
+            assert!(a > 20.0, "par de batido {f0}Hz: solo {a:.1}dB");
+        }
         // ...y el contenido del juego sobrevive (<3dB)
         for (f, nota) in [
             (41.2, "E1 sub-bajo"),
             (55.0, "A1"),
-            (61.7, "B1 (pegado al notch de 60)"),
+            (58.3, "Bb1 (borde inferior del par)"),
+            (61.7, "B1 (borde superior del par)"),
             (82.4, "E2"),
             (123.5, "B2 (pegado al notch de 120)"),
             (185.0, "F#3 (pegado al notch de 180)"),
@@ -1084,7 +1150,7 @@ mod tests {
             (440.0, "A4"),
         ] {
             let a = atten_db(&mut bank, f);
-            assert!(a < 3.0, "{nota} ({f}Hz) dañado: {a:.1}dB");
+            assert!(a < 4.0, "{nota} ({f}Hz) dañado: {a:.1}dB");
         }
     }
 

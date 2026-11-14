@@ -179,6 +179,24 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   fallo de REconexión (p.ej. Discord toma el device al reaparecer) =
   reintento indefinido con el settle de 1.5s (no martillar la MS2131).
   El audio ya se autorecupera solo (watchdog → rebuild cada 2s).
+- **Thump "tum tum" ~1Hz (14/11) — DIAGNOSTICADO con la suite**: el
+  usuario oyó un golpeteo sub-grave (~1/s, muy leve) solo con
+  video+audio. Diagnóstico con grabación dual (SCALAPP_REC/_OUT) +
+  tools/audio_diag.py: (1) los "drops" iniciales eran transientes de
+  la MÚSICA (uniformes mod-256, no en costuras de paquete); (2) el
+  culpable: DOS TONOS estacionarios del chip — 59.5 y 60.5Hz —
+  presentes en 18/18 ventanas de 8s (cristal-estables = no contenido),
+  que BATEAN a ~1Hz (la envolvente del 59.83 da AM a 0.90Hz): dos
+  componentes inaudibles por separado que se suman y cancelan una vez
+  por segundo. En 1080p60 nativo. Los notches viejos (60.06) no los
+  tocaban (±0.5Hz fuera de la banda Q=25). Fix: par + 2º armónicos
+  (59.5/60.5/119/121) a **Q=100** (estabilidad medida ±0.1Hz en 146s:
+  Q alto seguro) — Q=25 se comía Bb1 a -6.2dB. Test ampliado: par
+  >20dB, Bb1/B1/E1/A1/E2/B2 <4dB. `--notch-hum-at "F,F"` para
+  re-medir cuando el acople se mude de modo. El hum se CONFIRMA
+  mudándose de frecuencia entre configuraciones (29/10: 60.06 sola;
+  14/11: par 59.5/60.5) — si reaparece un thump en otro modo:
+  grabar 40s + audio_diag.py + fijar con el flag.
 - **Bug del binding nokhwa ARREGLADO — fps nativas (13/11)**: el usuario
   reportó que OBS a 1080p30 se ve notablemente mejor y pidió investigar.
   La causa era DOBLE, ambas en nokhwa-bindings-macos 0.2.4:
