@@ -1,120 +1,74 @@
-# ScalApp AV Monitor (Rust)
+# scalapp — Monitor A/V de baja latencia para capturadoras MS2131 (macOS)
 
-Monitor A/V en **Rust** para **visualizar una capturadora HDMI USB** con **audio + video sincronizados**. Esta es la versión canónica; el port original en Python vive en [`legacy/`](legacy/).
+Monitor de audio+video en Rust para la capturadora HDMI **MacroSilicon
+MS2131** (1080p60 YUYV por USB3), pensado para usar la Mac **como si
+fuera el monitor**: fluidez de 60fps reales, latencia baja, audio limpio
+y bajo consumo.
 
-## Por qué Rust
+> **Se usa junto a [`firmware_capturadora`](../firmware_capturadora)** —
+> el repo hermano de ingeniería inversa del chip (firmware 8051,
+> registros, parches de flash). Los hallazgos de ese repo
+> (registro de diezmado, hum de 60Hz, mapa XDATA del bloque de audio)
+> se convirtieron en los fixes y mitigaciones que corren acá. Ver
+> [Cómo se usan juntos](#cómo-se-usan-juntos).
 
-- El pipeline de audio (passthrough ~6-8ms) corre en callbacks nativos de CoreAudio sin pasar por el intérprete de Python en cada bloque.
-- Los frames de video se mueven por referencias (`Arc`) sin copias innecesarias; la conversión RGB→textura es la única copia.
-- Binario único sin venv, sin dependencias Python.
+## Features
 
-## Arquitectura (igual que la versión Python)
+- **Direct output**: latest-wins de un slot, pinta en la llegada del
+  frame (notifier → repaint), sin timers compitiendo. 60fps exactos.
+- **Decoder propio YUYV→RGBA en una pasada** (coeficientes BT.601
+  exactos de nokhwa, test byte-a-byte), ajuste de color en dominio
+  YUV. CPU 92%→19% medido en el camino.
+- **fps NATIVAS al device** (`--30`, `--video-fps N`): arreglo del
+  binding nokhwa vendoreado (doble bug: desempate de duplicados +
+  readback que mentía la fps máxima) — ver `vendor/`.
+- **Notch anti-hum ADAPTATIVO**: el chip inyecta tonos en el audio con
+  video activo (par batiendo ~1Hz); scalapp los mide en vivo (Goertzel)
+  y re-afina los notches quirúrgicos en caliente (Q=100, el bajo del
+  juego sobrevive).
+- **Recuperación de unplug/replug**: supervisor + puller (nokhwa se
+  cuelga para siempre al caer el USB), re-conexión por uniqueID
+  tolerante a cambio de puerto, cartel "SIN SEÑAL".
+- **Anti-webcam**: mapa clasificado de dispositivos; webcams/virtuales
+  jamás se abren.
+- `--dump-modes` (lista UVC completa), `--borderless`, `--list-devices`.
 
-```
-UVC Video Capture ─┐
-                    ├─► Latest-wins slot ─► Renderer (egui)   SyncController = monitor de drift
-UAC Audio Capture ─┘      (single)              ↑                  (reloj de audio vs video)
-                                              Audio Clock
-```
-
-El video corre con semántica **latest-wins** (Fase 1 del ROADMAP):
-single-slot, el renderer pinta siempre el último frame disponible
-(latencia de cola = 0), la captura pide el formato exacto
-1920x1080@60 al dispositivo y el overlay mide por separado fps de
-captura, fps pintados, frames skipped y edad del frame.
-
-| Python | Rust | Crate |
-|---|---|---|
-| sounddevice | cpal (CoreAudio nativo) | `cpal 0.15` |
-| OpenCV VideoCapture | nokhwa (AVFoundation nativo) | `nokhwa 0.10` |
-| PyQt6 | egui/eframe (GPU) | `eframe 0.29` |
-| NumPy buffers | buffers planos `f32`/`u8` | std |
-
-## Build
+## Uso
 
 ```bash
 cargo build --release
-# binario: target/release/scalapp
+./target/release/scalapp --video              # A/V completo 1080p60
+./target/release/scalapp --video --30         # 30fps nativos (económico)
+./target/release/scalapp --video --dump-modes # diagnóstico de modos
 ```
 
-Requiere Rust stable. En macOS usa AVFoundation + CoreAudio nativos, **no necesita OpenCV ni PortAudio instalados**.
+Teclas: `F` borderless · `P` pixel-perfect (1 texel = 1 px físico) ·
+`M` mipmaps · `S`/`O` overlays · `Q` salir.
 
-## Uso (flags idénticos a la versión Python)
+Diagnóstico de audio: `SCALAPP_REC=/tmp/in.raw` + `python3
+tools/audio_diag.py` (espectro fino, detector de drops, AM del hum).
 
-```bash
-# Audio-only por defecto, Direct Passthrough V4 (~6-8ms)
-scalapp
+## Cómo se usan juntos
 
-# Con block size personalizado
-scalapp --block-size 128   # ~4ms
-scalapp --block-size 512   # ~13ms
+| firmware_capturadora (el chip) | scalapp (el host) |
+|---|---|
+| RE del firmware 8051: diezmado 120→60 (f606), hot-switch, fix120 | pide el modo exacto por uniqueID; supervisor reconecta |
+| Hum del acople video→audio: par 59.5/60.5Hz batiendo | notch adaptativo que lo mide y lo mata en vivo |
+| Mapa XDATA del bloque de audio (f100-f12a) | diagnóstico y validación de mitigaciones |
+| Protocolo HID de fábrica + flash (backup/parche, checksum) | `--dump-modes`, pruebas de capacidades |
 
-# Arrancar con ventana borderless — sin barra de título ni bordes
-# (NO fullscreen: la ventana conserva tamaño y posición). El notch
-# anti-hum y la calibración de color van por defecto.
-scalapp --video --borderless
-
-# Ultra-low latency (8ms, sin passthrough directo)
-scalapp --ultra-low-latency
-
-# Modo completo A/V sincronizado — el notch anti-hum va por defecto
-scalapp --video                            # auto-detecta capturadora
-scalapp --video --no-notch-hum             # sin filtro (audio "virgen")
-
-# Colchón de audio en modo video (la capturadora dropea audio en ráfagas
-# con video activo; el colchón adaptativo lo cubre solo, esto fija la base)
-scalapp --video --audio-cushion-ms 150
-
-# El notch anti-hum (tono ~60Hz + armónicos con video streameando) va
-# ON por defecto desde 29/10 — quirúrgico: Q=25 toca B1/B2 a menos de
-# -2dB, el resto del audio intacto. Para audio "virgen":
-scalapp --video --no-notch-hum
-
-# + high-pass opcional para el rumor 28-38Hz (cuesta sub-bajo del contenido:
-# con 48Hz, E1/41Hz -9dB, A1/55Hz -4dB) — solo si el sub-bajo no importa
-scalapp --video --hpf 48
-
-# Utilidades
-scalapp --list-devices           # lista capturadoras HDMI detectadas
-scalapp --test-audio             # prueba dispositivos con detección de señal
-```
-
-### Controles modo audio-only (consola)
-
-`v`/`V`: bajar/subir volumen · `0-9`: volumen fijo · `m`: mute · `q`: salir
-(La escala 0-100% de la UI y de los comandos mapea al rango físico **0-30%** — arriba de eso satura; el % real se muestra junto al valor.)
-
-### Controles modo A/V (ventana)
-
-Checkboxes **Show Overlay**/**Show Stats** (Stats también muestra la barra de diagnóstico abajo), slider de volumen, botón **Borderless Mode**, **Quit**.
-Teclas: `F` borderless (sin barra de título, no fullscreen) · `O` overlay · `S` stats · `Esc` volver a ventana normal · `Q` salir.
-
-## Módulos
-
-```
-src/
-├── main.rs          CLI, orquestación (equivale a main.py)
-├── audio.rs         AudioCapture + AudioPlayback (audio_capture.py)
-├── passthrough.rs   Passthrough V4 con volumen (ultra_low_latency_passthrough.py)
-├── video.rs         VideoCapture con slot latest-wins + formato exacto (video_capture.py)
-├── sync.rs          SyncController (monitor de drift A/V) + AVMonitor
-├── renderer.rs      Ventana egui con overlays y medidores de fps
-├── devices.rs       Auto-detección HDMI (por uniqueID) + test-audio + list-devices
-└── atomicf32.rs     Helper para volumen lock-free entre callbacks
-```
-
-## Diferencias respecto al Python
-
-1. **Fix**: `V` (subir volumen) no funcionaba en Python porque el input se pasaba a minúsculas antes de comparar. Aquí `V` sube volumen.
-2. **IDs de dispositivos**: Python usa los índices intercalados de PortAudio (input+output juntos); Rust numera inputs y outputs por separado (los IDs mostrados por `--list-devices` son consistentes entre sí).
-3. **Captura de video**: se pide el formato exacto 1920x1080@60 (YUYV — macOS no expone los modos MJPEG de la MS2131) y se abre por uniqueID de AVFoundation porque el orden de índices cambia entre sesiones. Python forzaba FOURCC MJPG, que el backend AVFoundation de OpenCV ignoraba en la práctica.
-4. El panel flotante con hover del renderer PyQt se reemplaza por la barra de controles + teclas; en modo borderless los controles se ocultan igual.
+El flujo de trabajo: el firmware repo **mide y atribuye** en el
+silicio; scalapp **convierte el hallazgo en producto**. Ejemplo
+completo: `fw_re/NOTA_AUDIO_UPSTREAM.md` (thump ~1Hz — diagnóstico,
+atribución al dominio UVC, experimento all-in de 96k, veredicto).
 
 ## Tests
 
-```bash
-cargo test    # escala de volumen, ring buffer, latest-wins slot, drift stats, parser de comandos
-cargo clippy  # sin warnings nuevos (quedan 6 de clippy 1.98 sobre código previo: passthrough.rs/main.rs)
-```
+24 tests: decoder byte-a-byte vs nokhwa, gris exacto, equivalencia
+YUV/RGB, selección de modo consciente de aspecto/fps, detector del par
+de hum, notch móvil sin dañar Bb1/B1, decimation, ring.
 
-Nota: `cargo build` puede avisar sobre `block v0.1.6` (dependencia transitiva de nokhwa); es upstream y no afecta.
+## Estado
+
+Ver `ROADMAP.md` para la bitácora completa (fases, hallazgos de
+terreno, lecciones).
