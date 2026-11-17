@@ -217,6 +217,11 @@ struct Args {
     #[arg(long = "notch-hum-at", value_name = "F,F,...")]
     notch_hum_at: Option<String>,
 
+    /// Desactiva el notch adaptativo (por defecto mide el par de acople
+    /// real en vivo y re-afina los notches en caliente).
+    #[arg(long = "no-notch-auto")]
+    no_notch_auto: bool,
+
     /// Iniciar con ventana borderless: SIN barra de título ni bordes (no
     /// es fullscreen — la ventana conserva tamaño y posición). Igual que
     /// presionar F; F/Esc la devuelven a ventana normal.
@@ -357,6 +362,7 @@ fn run(args: Args) -> Result<()> {
         println!("✓ Audio cushion base: {}ms", args.audio_cushion_ms);
     }
     audio_capture.set_notch_hum(!args.no_notch_hum);
+    audio_capture.set_notch_auto(!args.no_notch_auto);
     audio_capture.set_hpf(args.hpf);
     if let Some(spec) = &args.notch_hum_at {
         // "--notch-hum-at 59.5,60.5" — frecuencias medidas con

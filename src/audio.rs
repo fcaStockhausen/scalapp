@@ -79,6 +79,7 @@ fn write_ring(ring: &mut Ring, data: &[f32], channels: usize, capacity_frames: u
     ring.write = end % capacity_frames;
 }
 
+#[derive(Clone)]
 struct NotchCoeffs {
     b0: f32,
     b1: f32,
@@ -147,7 +148,9 @@ impl NotchBank {
         ] {
             bank.push_notch(f0, q);
         }
-        bank
+        // + slots del par adaptativo (estacionados en defaults; el
+        // tracker los re-afina en caliente al medir el par real)
+        bank.with_auto_hum_slots()
     }
 
     /// Agrega un notch con Q propio (los tonos de acople del chip son
@@ -164,6 +167,40 @@ impl NotchBank {
             a2: (1.0 - alpha) / a0,
         });
         self.states.push([[0.0f32; 2]; 2]);
+    }
+
+    /// Slots del par adaptativo (siempre presentes; estacionados en los
+    /// defaults hasta que el tracker mide los reales). Slots fijos =
+    /// update_auto puede recompute coeficientes IN PLACE conservando
+    /// estados (sin click de reconstrucción).
+    pub fn with_auto_hum_slots(mut self) -> Self {
+        for f in [59.55f32, 60.45, 119.1, 120.9] {
+            self.push_notch(f, 100.0);
+        }
+        self
+    }
+
+    /// Re-afina el par adaptativo a las frecuencias MEDIDAS (Goertzel en
+    /// vivo). Solo recompute de los 4 coeficientes — los estados de los
+    /// biquads se conservan (continuidad de fase, sin transitorio).
+    pub fn update_auto(&mut self, f1: f64, f2: f64) {
+        let base = self.coeffs.len().saturating_sub(4);
+        for (i, f) in [f1, f2, f1 * 2.0, f2 * 2.0].into_iter().enumerate() {
+            let f0 = f as f32;
+            let q = 100.0f32;
+            let w0 = 2.0 * std::f32::consts::PI * f0 / self.fs;
+            let alpha = w0.sin() / (2.0 * q);
+            let a0 = 1.0 + alpha;
+            if let Some(c) = self.coeffs.get_mut(base + i) {
+                *c = NotchCoeffs {
+                    b0: 1.0 / a0,
+                    b1: (-2.0 * w0.cos()) / a0,
+                    b2: 1.0 / a0,
+                    a1: (-2.0 * w0.cos()) / a0,
+                    a2: (1.0 - alpha) / a0,
+                };
+            }
+        }
     }
 
     /// Agrega un high-pass 4º orden (2 biquads cascados). Opt-in via
@@ -206,6 +243,16 @@ impl NotchBank {
     }
 
     /// Filtra un buffer interleaved estéolo in-place.
+    /// Clona coeficientes+estados (para tests de re-afinado).
+    #[cfg(test)]
+    pub(crate) fn clone_bank_for_test(&self) -> Self {
+        Self {
+            fs: self.fs,
+            coeffs: self.coeffs.clone(),
+            states: self.states.clone(),
+        }
+    }
+
     pub(crate) fn process_interleaved(&mut self, buf: &mut [f32]) {
         for frame in buf.chunks_exact_mut(2) {
             let (l, r) = (frame[0], frame[1]);
@@ -227,10 +274,70 @@ pub struct AudioStreams {
     rebuild_fn: Option<Box<dyn Fn() -> Result<Stream>>>,
     wd_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     wd_handle: Option<std::thread::JoinHandle<()>>,
+    /// Tracker del hum (notch adaptativo).
+    hum_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    hum_handle: Option<std::thread::JoinHandle<()>>,
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
+/// Loop del notch adaptativo: cada 3s mide el par de acople real
+/// (Goertzel sobre los últimos 4s de entrada) y re-afina los slots
+/// del NotchBank. Confirma con 2 ventanas consecutivas estables antes
+/// de tocar; luego solo actualiza si se movió >0.03Hz.
+fn hum_auto_loop(
+    hb: Arc<Mutex<HumTrackerBuf>>,
+    playback: Arc<AudioPlayback>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    fs: f64,
+) {
+    let mut last: Option<(f64, f64)> = None;
+    let mut confirmed = false;
+    let mut committed: Option<(f64, f64)> = None;
+    let mut last_update = Instant::now();
+    loop {
+        for _ in 0..30 {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let snap = hb.lock().unwrap().snapshot();
+        if let Some((f1, f2)) = detect_hum_pair(&snap, fs) {
+            let stable = last.map_or(false, |(l, r)| {
+                (l - f1).abs() < 0.06 && (r - f2).abs() < 0.06
+            });
+            last = Some((f1, f2));
+            if !stable && !confirmed {
+                continue; // primera medición: exigir confirmación
+            }
+            confirmed = true;
+            let moved = committed.map_or(f64::MAX, |(c1, c2)| {
+                (c1 - f1).abs().max((c2 - f2).abs())
+            });
+            // el par VAGUEA ±0.05Hz dentro de la sesión (medido): la
+            // banda Q=100 (±0.3Hz) lo cubre de sobra — solo re-afinar si
+            // se movió de verdad (>0.1Hz) o pasaron >8s (anti-spam)
+            if moved > 0.1 || last_update.elapsed().as_secs() >= 8 {
+                let handle = playback.notch_handle.lock().unwrap().clone();
+                if let Some(bank) = handle.as_ref() {
+                    bank.lock().unwrap().update_auto(f1, f2);
+                    println!(
+                        "[notch-auto @{}] par {f1:.2}/{f2:.2}Hz (batido {:.2}Hz = período {:.2}s) → notches re-afinados",
+                        wall_clock(),
+                        f2 - f1,
+                        1.0 / (f2 - f1)
+                    );
+                    committed = Some((f1, f2));
+                    last_update = Instant::now();
+                }
+            }
+        } else {
+            // sin par claro (audio sin acople) — reset de confirmación
+            confirmed = false;
+        }
+    }
+}
+
+fn now_ms() -> u64 {    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
@@ -255,6 +362,12 @@ impl AudioStreams {
             f.store(true, Ordering::Relaxed);
         }
         if let Some(h) = self.wd_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(f) = self.hum_stop.take() {
+            f.store(true, Ordering::Relaxed);
+        }
+        if let Some(h) = self.hum_handle.take() {
             let _ = h.join();
         }
         drop(self.input.lock().unwrap().take());
@@ -301,6 +414,130 @@ impl AudioStreams {
     }
 }
 
+/// Potencia Goertzel de `f` sobre buf mono (rect window, f64).
+fn goertzel_power(buf: &[f32], fs: f64, f: f64) -> f64 {
+    let coeff = 2.0 * (2.0 * std::f64::consts::PI * f / fs).cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for chunk in buf.chunks(8192) {
+        for &v in chunk {
+            let s = f64::from(v) + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+    }
+    s1 * s1 + s2 * s2 - coeff * s1 * s2
+}
+
+/// Detecta el PAR de acople video→audio en una ventana mono (≥3s).
+///
+/// El par deriva ±0.15Hz entre sesiones (medido: 59.549/60.451 el
+/// 14/11, 59.64/60.34 el 17/11 — SIEMPRE simétrico alrededor de
+/// 60.000): los notches fijos lo agarran de refilón. Esto lo mide:
+/// barrido Goertzel 58.5-61.5, pico dominante a cada lado de 60,
+/// refinado parabólico. Requisitos (anti-falso-positivo contra bajo
+/// del contenido): prominencia ≥ +8dB sobre la mediana, simetría
+/// (f1+f2 = 120.000±0.25), cada pico en [59.45,59.95]/[60.05,60.55].
+pub fn detect_hum_pair(buf: &[f32], fs: f64) -> Option<(f64, f64)> {
+    let need = (fs * 3.0) as usize;
+    if buf.len() < need {
+        return None;
+    }
+    // ventana: últimos 4s (o todo si menos)
+    let win_len = (fs as usize * 4).min(buf.len());
+    let win = &buf[buf.len() - win_len..];
+    // quitar DC (el Goertzel rectangular es sensible)
+    let mean = win.iter().map(|v| f64::from(*v)).sum::<f64>() / win_len as f64;
+    let win: Vec<f32> = win.iter().map(|v| *v - mean as f32).collect();
+
+    // barrido
+    let step = 0.02f64;
+    let mut freqs = Vec::with_capacity(152);
+    let mut powers = Vec::with_capacity(152);
+    let mut f = 58.5f64;
+    while f <= 61.5 {
+        freqs.push(f);
+        powers.push(goertzel_power(&win, fs, f));
+        f += step;
+    }
+    let mut sorted = powers.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = sorted[sorted.len() / 2].max(1e-20);
+
+    let refine = |i: usize| -> f64 {
+        // interpolación parabólica del pico
+        if i == 0 || i + 1 >= powers.len() {
+            return freqs[i];
+        }
+        let (y0, y1, y2) = (powers[i - 1], powers[i], powers[i + 1]);
+        let denom = y0 - 2.0 * y1 + y2;
+        if denom.abs() < 1e-20 {
+            freqs[i]
+        } else {
+            freqs[i] + 0.5 * (y0 - y2) / denom * step
+        }
+    };
+    let (mut li, mut lp) = (0usize, 0.0f64);
+    let (mut ri, mut rp) = (0usize, 0.0f64);
+    for (i, &p) in powers.iter().enumerate() {
+        if p < med * 6.3 {
+            continue; // +8dB sobre la mediana
+        }
+        let is_peak = i > 0 && i + 1 < powers.len() && p >= powers[i - 1] && p >= powers[i + 1];
+        if !is_peak {
+            continue;
+        }
+        if freqs[i] < 60.0 && p > lp {
+            li = i;
+            lp = p;
+        }
+        if freqs[i] > 60.0 && p > rp {
+            ri = i;
+            rp = p;
+        }
+    }
+    if lp == 0.0 || rp == 0.0 {
+        return None;
+    }
+    let (l, r) = (refine(li), refine(ri));
+    if (l + r - 120.0).abs() > 0.25 {
+        return None;
+    }
+    if !(59.45..=59.95).contains(&l) || !(60.05..=60.55).contains(&r) {
+        return None;
+    }
+    Some((l, r))
+}
+
+/// Buffer mono (downmix L/R) de la entrada para el tracker del hum.
+pub struct HumTrackerBuf {
+    buf: Vec<f32>,
+    cap: usize,
+}
+
+impl HumTrackerBuf {
+    pub fn new(fs: u32) -> Self {
+        let cap = fs as usize * 5;
+        Self {
+            buf: Vec::with_capacity(cap),
+            cap,
+        }
+    }
+
+    pub fn feed(&mut self, interleaved: &[f32]) {
+        for p in interleaved.chunks_exact(2) {
+            self.buf.push((p[0] + p[1]) * 0.5);
+        }
+        if self.buf.len() > self.cap {
+            let drop = self.buf.len() - self.cap;
+            self.buf.drain(..drop);
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<f32> {
+        self.buf.clone()
+    }
+}
+
 pub struct AudioPlayback {
     buffer: Arc<Mutex<VecDeque<Vec<f32>>>>,
     multiplier: Arc<AtomicF32>,
@@ -309,6 +546,9 @@ pub struct AudioPlayback {
     /// Tope de la cola en SAMPLES (fix 29/10: con bloques Default de
     /// ~4096 frames, el tope "30 bloques" permitía ~2.5s de latencia).
     cap_samples: Arc<std::sync::atomic::AtomicUsize>,
+    /// Handle al NotchBank de la salida (para el tracker adaptativo:
+    /// re-afina las frecuencias en caliente sin reconstruir estados).
+    notch_handle: Mutex<Option<Arc<Mutex<NotchBank>>>>,
 }
 
 impl AudioPlayback {
@@ -319,6 +559,7 @@ impl AudioPlayback {
             low_latency,
             channels,
             cap_samples: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            notch_handle: Mutex::new(None),
         }
     }
 
@@ -413,6 +654,8 @@ impl AudioPlayback {
             Arc::new(Mutex::new(bank))
         });
         let notch_cb = notch_out.clone();
+        // handle para el tracker adaptativo (re-afinado en caliente)
+        *self.notch_handle.lock().unwrap() = notch_out.clone();
         let rec_out_file = std::env::var("SCALAPP_REC_OUT").ok().map(|path| {
             let f = std::fs::OpenOptions::new()
                 .create(true)
@@ -657,6 +900,8 @@ pub struct AudioCapture {
     hpf_hz: AtomicU32,
     /// Override de frecuencias de notch (--notch-hum-at).
     notch_override: std::sync::Mutex<Option<Vec<f32>>>,
+    /// Notch adaptativo ON (mide el par real y re-afina en caliente).
+    notch_auto: std::sync::atomic::AtomicBool,
 }
 
 impl AudioCapture {
@@ -691,6 +936,7 @@ impl AudioCapture {
             notch_hum: std::sync::atomic::AtomicBool::new(false),
             hpf_hz: AtomicU32::new(0),
             notch_override: std::sync::Mutex::new(None),
+            notch_auto: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -710,6 +956,11 @@ impl AudioCapture {
     /// 59.5/60.5). Re-medir con tools/audio_diag.py y fijar acá.
     pub fn set_notch_override(&self, freqs: Vec<f32>) {
         *self.notch_override.lock().unwrap() = Some(freqs);
+    }
+
+    /// Notch adaptativo on/off (--no-notch-auto).
+    pub fn set_notch_auto(&self, on: bool) {
+        self.notch_auto.store(on, Ordering::Relaxed);
     }
 
     /// High-pass opcional (--hpf, 0 = off).
@@ -812,6 +1063,9 @@ impl AudioCapture {
         // (cpal Device no es Send).
         let device_for_builder = device.clone();
         let config_for_builder = config.clone();
+        // Tracker del hum (notch adaptativo): buffer mono de la entrada
+        let hum_buf = Arc::new(Mutex::new(HumTrackerBuf::new(sample_rate)));
+        let hum_buf_in = hum_buf.clone();
         // Diagnóstico (30/10): gap entre callbacks de entrada (stall del
         // dispositivo) y cambios de tamaño de bloque (renegociación).
         let last_block_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -827,6 +1081,7 @@ impl AudioCapture {
             let last_block_len = last_block_len_in.clone();
             let cushion_gap = cushion_gap.clone();
             let rec_cb = rec_in.clone();
+            let hum_buf_cb = hum_buf_in.clone();
             let config = config_for_builder.clone();
             device_for_builder
                 .build_input_stream(
@@ -872,6 +1127,8 @@ impl AudioCapture {
                             let _ = rec.lock().unwrap().write_all(&bytes);
                         }
                         write_ring(&mut ring.lock().unwrap(), data, channels, capacity);
+                        // feed del tracker (lock corto: append de ~5ms)
+                        hum_buf_cb.lock().unwrap().feed(data);
                         total.fetch_add(frames as u64, Ordering::Relaxed);
                         if let Some(p) = playback_slot.lock().unwrap().as_ref() {
                             p.add_audio_data(data.to_vec());
@@ -897,23 +1154,51 @@ impl AudioCapture {
         );
 
         let mut playback_output = None;
+        // notch adaptativo: stop/handle del tracker
+        let mut hum_stop = None;
+        let mut hum_handle = None;
         if self.enable_playback {
             let playback = Arc::new(AudioPlayback::new(self.channels, self.low_latency_mode));
             let volume = *self.volume.lock().unwrap();
             playback.set_volume(scale_volume(volume));
             // bloque de salida pequeño también: aporta un bloque de latencia
             let out_bs = self.block_size.min(512);
+            // OJO: el clone ANTES del match — un guard temporario en el
+            // scrutinee del match vive TODO el cuerpo del match, y
+            // re-lockear notch_override adentro (condición del notch
+            // adaptativo) se autodeadlockeaba (hallado con sample+atos).
+            let notch_override_freqs = self.notch_override.lock().unwrap().clone();
             match playback.start(
                 sample_rate,
                 out_bs,
                 cushion_ms.clone(),
                 self.notch_hum.load(Ordering::Relaxed),
                 self.hpf_hz.load(Ordering::Relaxed),
-                self.notch_override.lock().unwrap().clone(),
+                notch_override_freqs,
             ) {
                 Ok(out_stream) => {
-                    *self.playback.lock().unwrap() = Some(playback);
+                    *self.playback.lock().unwrap() = Some(playback.clone());
                     playback_output = Some(out_stream);
+                    // Notch ADAPTATIVO: el par de acople deriva ±0.15Hz
+                    // entre sesiones — midámoslo en vivo y re-afinemos.
+                    if self.notch_auto.load(Ordering::Relaxed)
+                        && self.notch_hum.load(Ordering::Relaxed)
+                        && self.notch_override.lock().unwrap().is_none()
+                    {
+                        let stop_f = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let st = stop_f.clone();
+                        let hb = hum_buf.clone();
+                        let pb = playback.clone();
+                        let fs = f64::from(sample_rate);
+                        if let Ok(h) = std::thread::Builder::new()
+                            .name("hum-auto".into())
+                            .spawn(move || hum_auto_loop(hb, pb, st, fs))
+                        {
+                            hum_stop = Some(stop_f);
+                            hum_handle = Some(h);
+                            println!("✓ Notch adaptativo activo (mide el par real y re-afina en caliente)");
+                        }
+                    }
                     println!("✓ Audio playback/monitoring enabled (target ~{target_ms:.0}ms)");
                 }
                 Err(e) => {
@@ -973,6 +1258,8 @@ impl AudioCapture {
             rebuild_fn: Some(make_input),
             wd_stop,
             wd_handle,
+            hum_stop,
+            hum_handle,
         })
     }
 
@@ -1103,6 +1390,70 @@ mod tests {
         write_ring(&mut ring, &[1.0, 2.0, 3.0], 1, 4);
         ring.read = 1;
         assert_eq!(ring.available(4), 2);
+    }
+
+    #[test]
+    fn hum_pair_detector_encuentra_el_par_sintetico() {
+        // 4s @48k: par 59.66/60.34 (batido 0.68Hz) + ruido + contenido
+        let fs = 48000.0f64;
+        let n = fs as usize * 4;
+        let mut buf = Vec::with_capacity(n);
+        for t in 0..n {
+            let tt = t as f64 / fs;
+            let v = 0.02 * (2.0 * std::f64::consts::PI * 59.66 * tt).sin()
+                + 0.015 * (2.0 * std::f64::consts::PI * 60.34 * tt).sin()
+                + 0.05 * (2.0 * std::f64::consts::PI * 44.0 * tt).sin() // bajo del juego
+                + 0.002 * (tt * 48000.0 * 0.37).sin(); // ruido determinista
+            buf.push(v as f32);
+        }
+        let (f1, f2) = detect_hum_pair(&buf, fs).expect("debe detectar el par");
+        assert!((f1 - 59.66).abs() < 0.05, "f1={f1}");
+        assert!((f2 - 60.34).abs() < 0.05, "f2={f2}");
+    }
+
+    #[test]
+    fn hum_pair_detector_rechaza_tono_solo() {
+        // un solo tono (sin par simétrico) = no actualizar
+        let fs = 48000.0f64;
+        let n = fs as usize * 4;
+        let mut buf = Vec::with_capacity(n);
+        for t in 0..n {
+            let tt = t as f64 / fs;
+            buf.push((0.05 * (2.0 * std::f64::consts::PI * 60.4 * tt).sin()) as f32);
+        }
+        assert!(detect_hum_pair(&buf, fs).is_none());
+    }
+
+    #[test]
+    fn notch_update_auto_caza_el_par_movil() {
+        // el par DERIVA entre sesiones (59.55/60.45 → 59.66/60.34...):
+        // update_auto re-afina los slots y el par medido debe morir
+        // SIN tocar Bb1/B1.
+        let fs = 48000u32;
+        let mut bank = NotchBank::hum_notches(fs);
+        bank.update_auto(59.66, 60.34);
+        let n = fs as usize * 3;
+        let sine = |f: f32, t: usize| (2.0 * std::f32::consts::PI * f * t as f32 / fs as f32).sin();
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        let mut b = bank.clone_bank_for_test();
+        let atten = |bank: &mut NotchBank, f: f32| {
+            let mut x: Vec<f32> = (0..n).flat_map(|t| {
+                let s = sine(f, t);
+                [s, s]
+            })
+            .collect();
+            let rin = rms(&x);
+            bank.process_interleaved(&mut x);
+            20.0 * (rin / rms(&x[x.len() / 2..]).max(1e-12)).log10()
+        };
+        for f0 in [59.66f32, 60.34, 119.32, 120.68] {
+            let a = atten(&mut b, f0);
+            assert!(a > 20.0, "par medido {f0}Hz: solo {a:.1}dB");
+        }
+        for (f, nota) in [(58.27, "Bb1"), (61.74, "B1"), (55.0, "A1")] {
+            let a = atten(&mut b, f);
+            assert!(a < 4.0, "{nota} ({f}Hz) dañado: {a:.1}dB");
+        }
     }
 
     #[test]

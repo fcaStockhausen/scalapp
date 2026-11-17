@@ -206,6 +206,35 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   notch host-side es la mitigación correcta mientras no haya parche
   de firmware (el mecanismo fino — ISR del EP 0x82 — queda como
   milestone RE abierto).
+- **Cura de fondo en firmware: DESCARTADA por ahora (17/11 tarde,
+  experimentos en vivo)**: el bloque de audio es programable (f100
+  enable, f120 enable-modo-7, divisores f102-f12a) y las constantes de
+  tasa de video viven LITERALES dentro (f124:f125=120, f126:f127=60,
+  divisor ~2×fs en f12a). Escribir la constante "60" mató la entrega
+  de audio al instante — el pacing de muestras se deriva del dominio
+  de video POR DISEÑO. No hay parche de 1 byte; desacoplar exige
+  reescribir la derivación en un bloque PLL/DMA indocumentado con
+  riesgo de tirar el bus (pasó: replug lo revivió todo, flash intacto).
+  Veredicto operativo: notches host-side = la cura práctica.
+- **NOTCH ADAPTATIVO (17/11 noche) — el fix definitivo del thump**: el
+  FYI del usuario (tum cada 1.50s) delató lo que las verificaciones
+  previas taparon: el par de acople VAGUEA — 59.549/60.451 el 14/11,
+  59.54→59.64→59.58 DENTRO de una misma sesión el 17/11 — y los
+  notches fijos (aunque quirúrgicos) lo agarran de refilón. Fix:
+  `detect_hum_pair()` (Goertzel 58.5-61.5 + refinado parabólico,
+  anti-falso-positivo: prominencia +8dB, simetría ±0.25 de 120.000,
+  confirmación 2 ventanas) corre en un thread que cada 3s mide el par
+  REAL sobre los últimos 4s de entrada y `NotchBank::update_auto()`
+  re-afina los 4 slots in place (coeficientes nuevos, estados
+  conservados = sin click). Validado en vivo: sigue al par vagabundo
+  (log [notch-auto] con el período del batido), energía del par en la
+  salida al 7.8% relativa. `--no-notch-auto` para desactivar.
+  **Lección de yapa (deadlock self-inflicto)**: un
+  `self.notch_override.lock().unwrap().clone()` en el scrutinee del
+  `match playback.start(...)` mantiene el guard vivo TODO el cuerpo
+  del match (temporarios de Rust) — re-lockear adentro congelaba el
+  main sin panic. Hallado con sample+atos (AudioCapture::start en
+  psynch_mutexwait). Fix: hoist del clone antes del match.
 - **Bug del binding nokhwa ARREGLADO — fps nativas (13/11)**: el usuario
   reportó que OBS a 1080p30 se ve notablemente mejor y pidió investigar.
   La causa era DOBLE, ambas en nokhwa-bindings-macos 0.2.4:
