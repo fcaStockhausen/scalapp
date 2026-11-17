@@ -193,10 +193,19 @@ buffer reutilizado (adiós alloc de 8.3MB/frame).
   (59.5/60.5/119/121) a **Q=100** (estabilidad medida ±0.1Hz en 146s:
   Q alto seguro) — Q=25 se comía Bb1 a -6.2dB. Test ampliado: par
   >20dB, Bb1/B1/E1/A1/E2/B2 <4dB. `--notch-hum-at "F,F"` para
-  re-medir cuando el acople se mude de modo. El hum se CONFIRMA
-  mudándose de frecuencia entre configuraciones (29/10: 60.06 sola;
-  14/11: par 59.5/60.5) — si reaparece un thump en otro modo:
-  grabar 40s + audio_diag.py + fijar con el flag.
+  re-medir cuando el acople se mude de modo.
+- **CAUSA raíz atribuida (17/11, RE del firmware + capturas A/B)**:
+  ver fw_re/RE.md del repo hermano. Resumen: el acople es la BOMBA DE
+  VIDEO UVC del chip perturbando el isoc de audio (arbitración
+  interna del USB): el portador de los tonos SIGUE a la tasa UVC
+  (60fps→120.0Hz; --30→60.0/30.0Hz) y NO al HDMI de entrada (59.94
+  quedaría fijo) — capturas A/B con contenido lo clavan. El UAC no
+  tiene EP de feedback → el host no puede corregir la deriva → el
+  ruido queda en banda. En silicio: divisores de audio estáticos
+  (f102:f103=240, f142:f143=244), retuning dinámico falsificado. El
+  notch host-side es la mitigación correcta mientras no haya parche
+  de firmware (el mecanismo fino — ISR del EP 0x82 — queda como
+  milestone RE abierto).
 - **Bug del binding nokhwa ARREGLADO — fps nativas (13/11)**: el usuario
   reportó que OBS a 1080p30 se ve notablemente mejor y pidió investigar.
   La causa era DOBLE, ambas en nokhwa-bindings-macos 0.2.4:
