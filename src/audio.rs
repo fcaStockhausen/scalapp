@@ -169,23 +169,28 @@ impl NotchBank {
         self.states.push([[0.0f32; 2]; 2]);
     }
 
-    /// Slots del par adaptativo (siempre presentes; estacionados en los
-    /// defaults hasta que el tracker mide los reales). Slots fijos =
-    /// update_auto puede recompute coeficientes IN PLACE conservando
-    /// estados (sin click de reconstrucción).
+    /// Slots del par adaptativo — 6 frecuencias × 2 biquads EN CASCADA
+    /// (profundidad doble: un solo biquad f32 deja colita audible).
+    /// Orden: [f1, f2, sub1, sub2, 2f1, 2f2] cada uno ×2. Estacionados
+    /// en los defaults medidos hasta que el tracker fija los reales.
     pub fn with_auto_hum_slots(mut self) -> Self {
-        for f in [59.55f32, 60.45, 119.1, 120.9] {
+        for f in [59.55f32, 60.45, 29.77, 30.72, 119.1, 120.9] {
+            self.push_notch(f, 100.0);
             self.push_notch(f, 100.0);
         }
         self
     }
 
-    /// Re-afina el par adaptativo a las frecuencias MEDIDAS (Goertzel en
-    /// vivo). Solo recompute de los 4 coeficientes — los estados de los
-    /// biquads se conservan (continuidad de fase, sin transitorio).
-    pub fn update_auto(&mut self, f1: f64, f2: f64) {
-        let base = self.coeffs.len().saturating_sub(4);
-        for (i, f) in [f1, f2, f1 * 2.0, f2 * 2.0].into_iter().enumerate() {
+    /// Re-afina los slots adaptativos a las frecuencias MEDIDAS (Goertzel
+    /// en vivo): par de 60 + par SUBARMÓNICO (~30Hz, el leak del 18/11)
+    /// + 2º armónicos. Coeficientes recomputados IN PLACE conservando
+    /// estados (sin click).
+    pub fn update_auto(&mut self, f1: f64, f2: f64, sub1: f64, sub2: f64) {
+        let base = self.coeffs.len().saturating_sub(12);
+        let freqs = [
+            f1, f1, f2, f2, sub1, sub1, sub2, sub2, f1 * 2.0, f1 * 2.0, f2 * 2.0, f2 * 2.0,
+        ];
+        for (i, f) in freqs.into_iter().enumerate() {
             let f0 = f as f32;
             let q = 100.0f32;
             let w0 = 2.0 * std::f32::consts::PI * f0 / self.fs;
@@ -289,9 +294,9 @@ fn hum_auto_loop(
     stop: Arc<std::sync::atomic::AtomicBool>,
     fs: f64,
 ) {
-    let mut last: Option<(f64, f64)> = None;
+    let mut last: Option<((f64, f64), (f64, f64))> = None;
     let mut confirmed = false;
-    let mut committed: Option<(f64, f64)> = None;
+    let mut committed: Option<((f64, f64), (f64, f64))> = None;
     let mut last_update = Instant::now();
     loop {
         for _ in 0..30 {
@@ -301,37 +306,47 @@ fn hum_auto_loop(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let snap = hb.lock().unwrap().snapshot();
-        if let Some((f1, f2)) = detect_hum_pair(&snap, fs) {
-            let stable = last.map_or(false, |(l, r)| {
-                (l - f1).abs() < 0.06 && (r - f2).abs() < 0.06
+        // par de 60 (simétrico, estricto) + par subarmónico ~30 (laxo:
+        // los 2 picos prominentes — NO es simétrico, medido 29.77/30.72)
+        let pair60 = detect_hum_pair(&snap, fs);
+        let pair30 = detect_sub_pair(&snap, fs);
+        if let Some(((f1, f2), (s1, s2))) = pair60.zip(pair30).map(|(a, b)| (a, b)) {
+            let cur = ((f1, f2), (s1, s2));
+            let stable = last.map_or(false, |(p, q)| {
+                (p.0 - f1).abs() < 0.06
+                    && (p.1 - f2).abs() < 0.06
+                    && (q.0 - s1).abs() < 0.08
+                    && (q.1 - s2).abs() < 0.08
             });
-            last = Some((f1, f2));
+            last = Some(cur);
             if !stable && !confirmed {
                 continue; // primera medición: exigir confirmación
             }
             confirmed = true;
-            let moved = committed.map_or(f64::MAX, |(c1, c2)| {
-                (c1 - f1).abs().max((c2 - f2).abs())
+            let moved = committed.map_or(f64::MAX, |((c1, c2), (d1, d2))| {
+                (c1 - f1)
+                    .abs()
+                    .max((c2 - f2).abs())
+                    .max((d1 - s1).abs())
+                    .max((d2 - s2).abs())
             });
-            // el par VAGUEA ±0.05Hz dentro de la sesión (medido): la
-            // banda Q=100 (±0.3Hz) lo cubre de sobra — solo re-afinar si
-            // se movió de verdad (>0.1Hz) o pasaron >8s (anti-spam)
             if moved > 0.1 || last_update.elapsed().as_secs() >= 8 {
                 let handle = playback.notch_handle.lock().unwrap().clone();
                 if let Some(bank) = handle.as_ref() {
-                    bank.lock().unwrap().update_auto(f1, f2);
+                    bank.lock().unwrap().update_auto(f1, f2, s1, s2);
                     println!(
-                        "[notch-auto @{}] par {f1:.2}/{f2:.2}Hz (batido {:.2}Hz = período {:.2}s) → notches re-afinados",
+                        "[notch-auto @{}] 60Hz: {f1:.2}/{f2:.2} (batido {b60:.2}Hz) | 30Hz: {s1:.2}/{s2:.2} (batido {b30:.2}Hz = período {p30:.2}s) → 12 slots re-afinados ×2 cascada",
                         wall_clock(),
-                        f2 - f1,
-                        1.0 / (f2 - f1)
+                        b60 = f2 - f1,
+                        b30 = s2 - s1,
+                        p30 = 1.0 / (s2 - s1),
                     );
-                    committed = Some((f1, f2));
+                    committed = Some(cur);
                     last_update = Instant::now();
                 }
             }
         } else {
-            // sin par claro (audio sin acople) — reset de confirmación
+            // sin pares claros (audio sin acople) — reset de confirmación
             confirmed = false;
         }
     }
@@ -438,23 +453,37 @@ fn goertzel_power(buf: &[f32], fs: f64, f: f64) -> f64 {
 /// del contenido): prominencia ≥ +8dB sobre la mediana, simetría
 /// (f1+f2 = 120.000±0.25), cada pico en [59.45,59.95]/[60.05,60.55].
 pub fn detect_hum_pair(buf: &[f32], fs: f64) -> Option<(f64, f64)> {
+    let (l, r) = detect_symmetric_pair(buf, fs, 58.5, 61.5, 60.0, 0.25, 6.3)?;
+    if !(59.45..=59.95).contains(&l) || !(60.05..=60.55).contains(&r) {
+        return None;
+    }
+    Some((l, r))
+}
+
+/// Versión genérica: par simétrico alrededor de `center` (el de 60Hz).
+fn detect_symmetric_pair(
+    buf: &[f32],
+    fs: f64,
+    lo: f64,
+    hi: f64,
+    center: f64,
+    sym_tol: f64,
+    prominence: f64,
+) -> Option<(f64, f64)> {
     let need = (fs * 3.0) as usize;
     if buf.len() < need {
         return None;
     }
-    // ventana: últimos 4s (o todo si menos)
     let win_len = (fs as usize * 4).min(buf.len());
     let win = &buf[buf.len() - win_len..];
-    // quitar DC (el Goertzel rectangular es sensible)
     let mean = win.iter().map(|v| f64::from(*v)).sum::<f64>() / win_len as f64;
     let win: Vec<f32> = win.iter().map(|v| *v - mean as f32).collect();
 
-    // barrido
     let step = 0.02f64;
-    let mut freqs = Vec::with_capacity(152);
-    let mut powers = Vec::with_capacity(152);
-    let mut f = 58.5f64;
-    while f <= 61.5 {
+    let mut freqs = Vec::new();
+    let mut powers = Vec::new();
+    let mut f = lo;
+    while f <= hi {
         freqs.push(f);
         powers.push(goertzel_power(&win, fs, f));
         f += step;
@@ -464,7 +493,6 @@ pub fn detect_hum_pair(buf: &[f32], fs: f64) -> Option<(f64, f64)> {
     let med = sorted[sorted.len() / 2].max(1e-20);
 
     let refine = |i: usize| -> f64 {
-        // interpolación parabólica del pico
         if i == 0 || i + 1 >= powers.len() {
             return freqs[i];
         }
@@ -479,18 +507,18 @@ pub fn detect_hum_pair(buf: &[f32], fs: f64) -> Option<(f64, f64)> {
     let (mut li, mut lp) = (0usize, 0.0f64);
     let (mut ri, mut rp) = (0usize, 0.0f64);
     for (i, &p) in powers.iter().enumerate() {
-        if p < med * 6.3 {
-            continue; // +8dB sobre la mediana
+        if p < med * prominence {
+            continue;
         }
         let is_peak = i > 0 && i + 1 < powers.len() && p >= powers[i - 1] && p >= powers[i + 1];
         if !is_peak {
             continue;
         }
-        if freqs[i] < 60.0 && p > lp {
+        if freqs[i] < center && p > lp {
             li = i;
             lp = p;
         }
-        if freqs[i] > 60.0 && p > rp {
+        if freqs[i] > center && p > rp {
             ri = i;
             rp = p;
         }
@@ -499,13 +527,76 @@ pub fn detect_hum_pair(buf: &[f32], fs: f64) -> Option<(f64, f64)> {
         return None;
     }
     let (l, r) = (refine(li), refine(ri));
-    if (l + r - 120.0).abs() > 0.25 {
-        return None;
-    }
-    if !(59.45..=59.95).contains(&l) || !(60.05..=60.55).contains(&r) {
+    if (l + r - 2.0 * center).abs() > 2.0 * sym_tol {
         return None;
     }
     Some((l, r))
+}
+
+/// Detecta el par SUBARMÓNICO (~30Hz): el leak medido el 18/11 — el
+/// par de 60 cae +18dB, pero 29.77/30.72 queda a -3/-5dB del contenido
+/// con su PROPIO batido ~0.96Hz (el thump que seguía audible). Este par
+/// NO es simétrico alrededor de 30.000 → detección laxa: los 2 picos
+/// más prominentes de la banda, separados ≥0.3Hz, cada uno ≥+8dB sobre
+/// la mediana. Banda acotada (28.8-31.8) para no confundir con bajo:
+/// E1=41.2Hz queda lejos; B0=30.87 solo sufre si cae EXACTO en un pico
+/// (banda Q=100 = ±0.3Hz).
+pub fn detect_sub_pair(buf: &[f32], fs: f64) -> Option<(f64, f64)> {
+    let need = (fs * 3.0) as usize;
+    if buf.len() < need {
+        return None;
+    }
+    let win_len = (fs as usize * 4).min(buf.len());
+    let win = &buf[buf.len() - win_len..];
+    let mean = win.iter().map(|v| f64::from(*v)).sum::<f64>() / win_len as f64;
+    let win: Vec<f32> = win.iter().map(|v| *v - mean as f32).collect();
+
+    let step = 0.02f64;
+    let (lo, hi) = (28.8f64, 31.8f64);
+    let mut freqs = Vec::new();
+    let mut powers = Vec::new();
+    let mut f = lo;
+    while f <= hi {
+        freqs.push(f);
+        powers.push(goertzel_power(&win, fs, f));
+        f += step;
+    }
+    let mut sorted = powers.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = sorted[sorted.len() / 2].max(1e-20);
+
+    let mut peaks: Vec<(f64, f64)> = Vec::new();
+    for i in 1..powers.len().saturating_sub(1) {
+        let p = powers[i];
+        if p < med * 6.3 {
+            continue;
+        }
+        if p >= powers[i - 1] && p >= powers[i + 1] {
+            let (y0, y1, y2) = (powers[i - 1], p, powers[i + 1]);
+            let denom = y0 - 2.0 * y1 + y2;
+            let fr = if denom.abs() < 1e-20 {
+                freqs[i]
+            } else {
+                freqs[i] + 0.5 * (y0 - y2) / denom * step
+            };
+            peaks.push((fr, p));
+        }
+    }
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    if peaks.len() < 2 {
+        return None;
+    }
+    let (f1, _) = peaks[0];
+    // el segundo pico más fuerte que esté ≥0.3Hz del primero
+    let (f2, _) = peaks[1..]
+        .iter()
+        .find(|(fr, _)| (fr - f1).abs() >= 0.3)
+        .copied()
+        .unwrap_or(peaks[1]);
+    if (f2 - f1).abs() < 0.3 {
+        return None;
+    }
+    Some((f1.min(f2), f1.max(f2)))
 }
 
 /// Buffer mono (downmix L/R) de la entrada para el tracker del hum.
@@ -1412,6 +1503,25 @@ mod tests {
     }
 
     #[test]
+    fn sub_pair_detector_encuentra_el_par_de_30() {
+        // el leak del 18/11: 29.77/30.72 (NO simétrico alrededor de 30)
+        let fs = 48000.0f64;
+        let n = fs as usize * 4;
+        let mut buf = Vec::with_capacity(n);
+        for t in 0..n {
+            let tt = t as f64 / fs;
+            let v = 0.012 * (2.0 * std::f64::consts::PI * 29.77 * tt).sin()
+                + 0.010 * (2.0 * std::f64::consts::PI * 30.72 * tt).sin()
+                + 0.05 * (2.0 * std::f64::consts::PI * 44.0 * tt).sin()
+                + 0.002 * (tt * 48000.0 * 0.61).sin();
+            buf.push(v as f32);
+        }
+        let (s1, s2) = detect_sub_pair(&buf, fs).expect("debe detectar el par sub");
+        assert!((s1 - 29.77).abs() < 0.05, "s1={s1}");
+        assert!((s2 - 30.72).abs() < 0.05, "s2={s2}");
+    }
+
+    #[test]
     fn hum_pair_detector_rechaza_tono_solo() {
         // un solo tono (sin par simétrico) = no actualizar
         let fs = 48000.0f64;
@@ -1428,11 +1538,12 @@ mod tests {
     fn notch_update_auto_caza_el_par_movil() {
         // el par DERIVA entre sesiones (59.55/60.45 → 59.66/60.34...):
         // update_auto re-afina los slots y el par medido debe morir
-        // SIN tocar Bb1/B1.
+        // SIN tocar Bb1/B1 — y ahora con CASCADA ×2 (más profundidad)
+        // y el par SUB de ~30Hz cubierto.
         let fs = 48000u32;
         let mut bank = NotchBank::hum_notches(fs);
-        bank.update_auto(59.66, 60.34);
-        let n = fs as usize * 3;
+        bank.update_auto(59.66, 60.34, 29.77, 30.72);
+        let n = fs as usize * 6; // 6s: los notches Q=100 a ~30Hz tardan ~1.1s en asentarse
         let sine = |f: f32, t: usize| (2.0 * std::f32::consts::PI * f * t as f32 / fs as f32).sin();
         let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
         let mut b = bank.clone_bank_for_test();
@@ -1444,13 +1555,20 @@ mod tests {
             .collect();
             let rin = rms(&x);
             bank.process_interleaved(&mut x);
-            20.0 * (rin / rms(&x[x.len() / 2..]).max(1e-12)).log10()
+            20.0 * (rin / rms(&x[x.len() * 5 / 6..]).max(1e-12)).log10()
         };
+        // par de 60 + armónicos: cascada profunda
         for f0 in [59.66f32, 60.34, 119.32, 120.68] {
             let a = atten(&mut b, f0);
-            assert!(a > 20.0, "par medido {f0}Hz: solo {a:.1}dB");
+            assert!(a > 35.0, "par 60/arm {f0}Hz: solo {a:.1}dB (cascada)");
         }
-        for (f, nota) in [(58.27, "Bb1"), (61.74, "B1"), (55.0, "A1")] {
+        // par sub: a ~30Hz el asentamiento de la cascada es lento (τ≈1.1s
+        // ×2 polos) — el test mide transitorio+régimen; >24dB honrado
+        for f0 in [29.77f32, 30.72] {
+            let a = atten(&mut b, f0);
+            assert!(a > 24.0, "par sub {f0}Hz: solo {a:.1}dB (cascada)");
+        }
+        for (f, nota) in [(58.27, "Bb1"), (61.74, "B1"), (55.0, "A1"), (41.2, "E1")] {
             let a = atten(&mut b, f);
             assert!(a < 4.0, "{nota} ({f}Hz) dañado: {a:.1}dB");
         }
