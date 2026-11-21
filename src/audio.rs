@@ -294,9 +294,13 @@ fn hum_auto_loop(
     stop: Arc<std::sync::atomic::AtomicBool>,
     fs: f64,
 ) {
-    let mut last: Option<((f64, f64), (f64, f64))> = None;
-    let mut confirmed = false;
-    let mut committed: Option<((f64, f64), (f64, f64))> = None;
+    let mut last60: Option<(f64, f64)> = None;
+    let mut last30: Option<(f64, f64)> = None;
+    let mut confirm60 = false;
+    let mut confirm30 = false;
+    // comprometido = lo que ya está aplicado al banco
+    let mut applied60: Option<(f64, f64)> = None;
+    let mut applied30: Option<(f64, f64)> = None;
     let mut last_update = Instant::now();
     loop {
         for _ in 0..30 {
@@ -306,48 +310,67 @@ fn hum_auto_loop(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let snap = hb.lock().unwrap().snapshot();
-        // par de 60 (simétrico, estricto) + par subarmónico ~30 (laxo:
-        // los 2 picos prominentes — NO es simétrico, medido 29.77/30.72)
-        let pair60 = detect_hum_pair(&snap, fs);
-        let pair30 = detect_sub_pair(&snap, fs);
-        if let Some(((f1, f2), (s1, s2))) = pair60.zip(pair30).map(|(a, b)| (a, b)) {
-            let cur = ((f1, f2), (s1, s2));
-            let stable = last.map_or(false, |(p, q)| {
-                (p.0 - f1).abs() < 0.06
-                    && (p.1 - f2).abs() < 0.06
-                    && (q.0 - s1).abs() < 0.08
-                    && (q.1 - s2).abs() < 0.08
-            });
-            last = Some(cur);
-            if !stable && !confirmed {
-                continue; // primera medición: exigir confirmación
+        // par de 60 (simétrico, estricto)
+        if let Some((f1, f2)) = detect_hum_pair(&snap, fs) {
+            let stable = last60
+                .map_or(false, |(l, r)| (l - f1).abs() < 0.06 && (r - f2).abs() < 0.06);
+            last60 = Some((f1, f2));
+            if stable || confirm60 {
+                confirm60 = true;
             }
-            confirmed = true;
-            let moved = committed.map_or(f64::MAX, |((c1, c2), (d1, d2))| {
-                (c1 - f1)
-                    .abs()
-                    .max((c2 - f2).abs())
-                    .max((d1 - s1).abs())
-                    .max((d2 - s2).abs())
-            });
-            if moved > 0.1 || last_update.elapsed().as_secs() >= 8 {
-                let handle = playback.notch_handle.lock().unwrap().clone();
-                if let Some(bank) = handle.as_ref() {
-                    bank.lock().unwrap().update_auto(f1, f2, s1, s2);
-                    println!(
-                        "[notch-auto @{}] 60Hz: {f1:.2}/{f2:.2} (batido {b60:.2}Hz) | 30Hz: {s1:.2}/{s2:.2} (batido {b30:.2}Hz = período {p30:.2}s) → 12 slots re-afinados ×2 cascada",
-                        wall_clock(),
-                        b60 = f2 - f1,
-                        b30 = s2 - s1,
-                        p30 = 1.0 / (s2 - s1),
-                    );
-                    committed = Some(cur);
-                    last_update = Instant::now();
+        }
+        // par subarmónico ~30 (laxo)
+        if let Some((s1, s2)) = detect_sub_pair(&snap, fs) {
+            let stable = last30
+                .map_or(false, |(l, r)| (l - s1).abs() < 0.08 && (r - s2).abs() < 0.08);
+            last30 = Some((s1, s2));
+            if stable || confirm30 {
+                confirm30 = true;
+            }
+        }
+        // actualizar con lo que haya confirmado (INDEPENDIENTES: si el
+        // par de 30 no aparece en la sesión, el de 60 igual se re-afina
+        // — bug previo: exigir ambos dejaba TODO estacionado)
+        if !(confirm60 || confirm30) {
+            continue;
+        }
+        let cand60 = if confirm60 { last60 } else { None };
+        let cand30 = if confirm30 { last30 } else { None };
+        let moved = {
+            let m60 = match (cand60, applied60) {
+                (Some((a, b)), Some((c, d))) => {
+                    (a - c).abs().max((b - d).abs()) > 0.1
                 }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            let m30 = match (cand30, applied30) {
+                (Some((a, b)), Some((c, d))) => {
+                    (a - c).abs().max((b - d).abs()) > 0.1
+                }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            m60 || m30
+        };
+        if moved || last_update.elapsed().as_secs() >= 8 {
+            let (f1, f2) = cand60.or(applied60).unwrap_or((59.55, 60.45));
+            let (s1, s2) = cand30.or(applied30).unwrap_or((29.77, 30.72));
+            let handle = playback.notch_handle.lock().unwrap().clone();
+            if let Some(bank) = handle.as_ref() {
+                bank.lock().unwrap().update_auto(f1, f2, s1, s2);
+                println!(
+                    "[notch-auto @{}] 60Hz: {f1:.2}/{f2:.2} (batido {b60:.2}Hz) | 30Hz: {s1:.2}/{s2:.2} (batido {b30:.2}Hz = período {p30:.2}s){src}",
+                    wall_clock(),
+                    b60 = f2 - f1,
+                    b30 = s2 - s1,
+                    p30 = 1.0 / (s2 - s1).max(1e-6),
+                    src = if moved { " → re-afinado" } else { "" },
+                );
+                applied60 = cand60.or(applied60);
+                applied30 = cand30.or(applied30);
+                last_update = Instant::now();
             }
-        } else {
-            // sin pares claros (audio sin acople) — reset de confirmación
-            confirmed = false;
         }
     }
 }
