@@ -371,6 +371,14 @@ fn hum_auto_loop(
                 applied30 = cand30.or(applied30);
                 last_update = Instant::now();
             }
+            // el corrector de envolvente recibe el BATIDO del par de 60
+            // como target: el ripple de ganancia y el batido son el
+            // mismo pump (sin esto el corrector trababa en fantasma a
+            // 0.32Hz — dinámica del contenido, 21/11)
+            let ec_handle = playback.env_handle.lock().unwrap().clone();
+            if let Some(ec) = ec_handle.as_ref() {
+                ec.lock().unwrap().set_target_hz(f2 - f1);
+            }
         }
     }
 }
@@ -622,79 +630,104 @@ pub fn detect_sub_pair(buf: &[f32], fs: f64) -> Option<(f64, f64)> {
     Some((f1.min(f2), f1.max(f2)))
 }
 
-/// Corrector de la modulación de GANANCIA del chip (el último estrato
-/// del acople video→audio, medido 20/11: ripple de 1.7dB pico a
-/// 0.617Hz sobre TODO el contenido — la envolvente de los pulsos que
-/// el usuario oye; imposible de notchear porque es amplitud, no
-/// espectro).
+/// Corrector de la modulación de GANANCIA del chip (el estrato final
+/// del acople video→audio: escalera de bandas laterales FM a ±0.59Hz
+/// del pump — los notches matan el par central pero los lóbulos ±1/±2
+/// siguen batiendo; AM residual medida 1.0-1.4dB a 0.594Hz en la
+/// salida, 20/11, suite v3 conf 8-11x).
 ///
-/// Lock-in: detecta el pico de envolvente en 0.3-1.2Hz, mide la
-/// componente sinusoidal (d, φ) por cuadratura y aplica la ganancia
-/// inversa 1/(1+d·sin(ωt+φ)) — SOLO aplana ese ripple. La dinámica
-/// real del contenido (transientes, tremolo musical) pasa intacta.
+/// Lock-in: mide la componente sinusoidal del ripple de envolvente en
+/// 0.3-1.2Hz (I/Q por cuadratura sobre ~4s de RMS por bloque) y aplica
+/// la ganancia inversa 1/(1+d·sin(ωt+ψ)) — solo aplana ESE ripple; la
+/// dinámica real del contenido pasa intacta.
+///
+/// Matemática (verificada): env[i] = M·(1 + d·sin(ω·(t−t₀)+φ₀)) con
+/// t₀ = inicio del ring. I = Σ env·cos(ωt) = M·d·N/2·sin(φ₀);
+/// Q = Σ env·sin(ωt) = M·d·N/2·cos(φ₀) → d = 2√(I²+Q²)/(M·N),
+/// φ₀ = atan2(I,Q), y ψ (fase absoluta) = φ₀ − ω·t₀.
 pub struct EnvelopeCorrector {
     env_ring: Vec<f32>,
     env_cap: usize,
     block_dt: f64,
-    block_acc: f64,
-    block_n: usize,
     t: f64,
+    next_relock_t: f64,
     omega: f64,
     d: f64,
-    phi: f64,
-    locked: bool,
-    last_relock: Instant,
+    psi: f64,
+    active: bool,
+    /// Frecuencia objetivo (Hz) fijada por el tracker del hum: el
+    /// ripple de ganancia y el batido del par de tonos SON el mismo
+    /// fenómeno (el pump del chip) — sin target el scan caía en
+    /// dinámica lenta del contenido (fantasma a 0.32Hz, 21/11).
+    target_hz: Option<f64>,
 }
 
 impl EnvelopeCorrector {
     pub fn new(block_size: usize, sample_rate: u32) -> Self {
-        let block_dt = block_size as f64 / f64::from(sample_rate) / 2.0; // estéreo intercalado
+        let block_dt = block_size as f64 / f64::from(sample_rate);
         Self {
             env_ring: Vec::new(),
-            env_cap: 360, // ~4s a bloque de ~10.7ms
+            env_cap: 384, // ~4s de bloques
             block_dt,
-            block_acc: 0.0,
-            block_n: 0,
             t: 0.0,
+            // DSP determinista: el relock se agenda por RELOJ DE MUESTRAS,
+            // no de pared (el wall-clock rompía los tests — 30s de audio
+            // en ms de CPU — y acoplaba el filtro al scheduler del SO)
+            next_relock_t: 2.5,
             omega: 0.0,
             d: 0.0,
-            phi: 0.0,
-            locked: false,
-            last_relock: Instant::now(),
+            psi: 0.0,
+            active: false,
+            // bootstrap: mediana de todos los batidos medidos en terreno
+            // (0.58-0.73Hz) — el tracker lo pisa con el medido cuando
+            // confirma; sin esto, en contenido quedado (tonos bajo el
+            // umbral del detector) el corrector quedaba pasivo justo
+            // cuando el pulso más se oye
+            target_hz: Some(0.65),
         }
     }
 
-    /// Procesa un bloque interleaved estéreo: mide envolvente, relockea
-    /// cada ~1.2s, aplica la ganancia inversa del ripple medido.
+    /// Fija la frecuencia del ripple medida por el tracker del hum
+    /// (batido del par de tonos). Con target, el lock-in no escanea:
+    /// mide profundidad y fase a ESA frecuencia exacta.
+    pub fn set_target_hz(&mut self, hz: f64) {
+        if (0.1..=5.0).contains(&hz) {
+            self.target_hz = Some(hz);
+        }
+    }
+
+    /// Procesa un bloque interleaved estéreo: mide RMS, relockea cada
+    /// 1.2s, aplica ganancia inversa al bloque actual.
     pub fn process_interleaved(&mut self, buf: &mut [f32]) {
-        // 1) acumular energía del bloque (mono sum)
+        // 1) energía del bloque (mono) — ANTES de tocar la ganancia
         let mut acc = 0.0f64;
+        let mut n = 0usize;
         for p in buf.chunks_exact(2) {
             let m = (f64::from(p[0]) + f64::from(p[1])) * 0.5;
             acc += m * m;
+            n += 1;
         }
-        let n = (buf.len() / 2) as f64;
-        let rms = (acc / n.max(1.0)).sqrt() as f32;
+        let rms = (acc / n.max(1) as f64).sqrt() as f32;
+        let t_block = self.t;
+        self.t += self.block_dt;
         self.env_ring.push(rms);
         if self.env_ring.len() > self.env_cap {
             let drop = self.env_ring.len() - self.env_cap;
             self.env_ring.drain(..drop);
         }
-        self.t += self.block_dt;
 
-        // 2) relock periódico (lock-in sobre la envolvente)
-        if self.last_relock.elapsed().as_secs_f64() >= 1.2
-            && self.env_ring.len() >= self.env_cap / 2
-        {
+        // 2) relock agendado por reloj de muestras
+        if self.t >= self.next_relock_t && self.env_ring.len() >= self.env_cap / 2 {
             self.relock();
-            self.last_relock = Instant::now();
+            self.next_relock_t = self.t + 1.2;
         }
 
-        // 3) ganancia inversa para ESTE bloque (constante dentro del
-        //    bloque: pasos de ≤0.5% cada 10.7ms = inaudibles)
-        if self.locked && self.d > 0.02 {
-            let ripple = self.d * (self.omega * self.t + self.phi).sin();
-            let gain = (1.0 / (1.0 + ripple)).clamp(0.7, 1.45) as f32;
+        // 3) ganancia inversa del ripple medido — SOLO con target del
+        //    tracker (el scan a ciegas trababa en dinámica del contenido:
+        //    fantasma a 0.30-0.32Hz, 21/11). Sin target: pasivo.
+        if self.active && self.d > 0.02 && self.target_hz.is_some() {
+            let ripple = self.d * (self.omega * t_block + self.psi).sin();
+            let gain = (1.0 / (1.0 + ripple)).clamp(0.75, 1.35) as f32;
             for s in buf.iter_mut() {
                 *s *= gain;
             }
@@ -703,71 +736,80 @@ impl EnvelopeCorrector {
 
     fn relock(&mut self) {
         let n = self.env_ring.len();
-        if n < 32 {
+        if n < 64 {
             return;
         }
-        let mean: f64 = self.env_ring.iter().map(f64::from).sum::<f64>() / n as f64;
+        let mean: f64 = self.env_ring.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
         if mean < 1e-6 {
-            return; // silencio: sin corrección
+            self.active = false; // silencio: sin corrección
+            return;
         }
         let dt = self.block_dt;
-        let fs_env = 1.0 / dt;
-        // detectar el pico de envolvente 0.3-1.2Hz (Goertzel fino)
+        // BUG del debug-test: la DC (mean) domina el Goertzel y desvía
+        // el scan a frecuencias altas → centrar ANTES de medir
+        let centered: Vec<f64> = self.env_ring.iter().map(|v| f64::from(*v) - mean).collect();
+        // 1) frecuencia del ripple: target del tracker si existe (el
+        // batido medido del par de tonos = el mismo pump); si no, scan
         let mut best_f = 0.0f64;
-        let mut best_p = 0.0f64;
-        let mut f = 0.30f64;
-        while f <= 1.20 {
-            let w = 2.0 * std::f64::consts::PI * f;
-            let coeff = 2.0 * w.cos();
-            let (mut s1, mut s2) = (0.0f64, 0.0f64);
-            for &v in &self.env_ring {
-                let s = f64::from(v) + coeff * s1 - s2;
-                s2 = s1;
-                s1 = s;
+        if let Some(hz) = self.target_hz {
+            best_f = hz;
+        } else {
+            let mut best_p = 0.0f64;
+            let mut f = 0.30f64;
+            while f <= 1.20 {
+                // BUG raíz: w debe ser 2π·f·dt (frecuencia NORMALIZADA por
+                // muestra) — sin el dt el Goertzel resuena en aliasing
+                let w = 2.0 * std::f64::consts::PI * f * dt;
+                let coeff = 2.0 * w.cos();
+                let (mut s1, mut s2) = (0.0f64, 0.0f64);
+                for &v in &centered {
+                    let s = v + coeff * s1 - s2;
+                    s2 = s1;
+                    s1 = s;
+                }
+                let p = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+                if p > best_p {
+                    best_p = p;
+                    best_f = f;
+                }
+                f += 0.01;
             }
-            let p = s1 * s1 + s2 * s2 - coeff * s1 * s2;
-            if p > best_p {
-                best_p = p;
-                best_f = f;
-            }
-            f += 0.01;
         }
-        if best_f < 0.3 {
+        if best_f < 0.1 {
             return;
         }
-        // lock-in a best_f: amplitud y fase por cuadratura
+        // 2) lock-in a best_f sobre la señal centrada
         let omega = 2.0 * std::f64::consts::PI * best_f;
         let (mut isum, mut qsum) = (0.0f64, 0.0f64);
-        for (i, &v) in self.env_ring.iter().enumerate() {
-            let tt = i as f64 * dt;
-            let ph = omega * tt;
-            isum += f64::from(v) * ph.cos();
-            qsum += f64::from(v) * ph.sin();
+        for (i, &v) in centered.iter().enumerate() {
+            let th = omega * (i as f64) * dt;
+            isum += v * th.cos();
+            qsum += v * th.sin();
         }
-        // |I+iQ|·2/N = amplitud del sinus (relativa al mean)
-        let amp = 2.0 * (isum * isum + qsum * qsum).sqrt() / n as f64;
-        let d = (amp / mean - 1.0).abs().min(0.4);
-        let t_now = self.t;
-        // fase al tiempo actual: φ tal que sin(ω·t_now + φ) alinee con
-        // la medición (tt=0 en el inicio del ring → offset)
-        let phi_meas = qsum.atan2(isum); // fase del cos... ajuste:
-        let phi = phi_meas - omega * t_now + std::f64::consts::FRAC_PI_2;
+        // I = M·d·N/2·sin(φ₀); Q = M·d·N/2·cos(φ₀)
+        let d = (2.0 * (isum * isum + qsum * qsum).sqrt() / (mean * n as f64)).min(0.3);
+        let phi0 = isum.atan2(qsum); // atan2(sin, cos)
+        // fase absoluta: ripple(t) = d·sin(ω(t − t₀) + φ₀), t₀ = tiempo
+        // del primer sample del ring
+        let t0 = self.t - (n as f64 - 1.0) * dt;
+        let psi = phi0 - omega * t0;
+        let was_active = self.active;
         self.omega = omega;
-        self.phi = phi;
+        self.psi = psi;
         self.d = d;
-        self.locked = true;
-        if d > 0.05 {
+        self.active = d > 0.02;
+        if self.active && !was_active && d > 0.05 {
             println!(
-                "[env-correct] ripple de ganancia {d:.2}x (~{db:.1}dB) a {hz:.2}Hz (período {p:.2}s) → corrigiendo",
-                db = 20.0 * (1.0 + d).log10(),
-                hz = best_f,
-                p = 1.0 / best_f,
+                "[env-correct] ripple de ganancia {d:.3} ({:.1}dB) a {best_f:.2}Hz (período {:.2}s) → corrigiendo",
+                20.0 * (1.0 + d).log10(),
+                1.0 / best_f,
             );
         }
     }
 }
 
-
+/// Buffer mono (downmix L/R) de la entrada para el tracker del hum.
+pub struct HumTrackerBuf {
     buf: Vec<f32>,
     cap: usize,
 }
@@ -807,6 +849,9 @@ pub struct AudioPlayback {
     /// Handle al NotchBank de la salida (para el tracker adaptativo:
     /// re-afina las frecuencias en caliente sin reconstruir estados).
     notch_handle: Mutex<Option<Arc<Mutex<NotchBank>>>>,
+    /// Handle al corrector de envolvente (el tracker le pasa la
+    /// frecuencia del ripple = batido del par de tonos).
+    env_handle: Mutex<Option<Arc<Mutex<EnvelopeCorrector>>>>,
 }
 
 impl AudioPlayback {
@@ -818,6 +863,7 @@ impl AudioPlayback {
             channels,
             cap_samples: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             notch_handle: Mutex::new(None),
+            env_handle: Mutex::new(None),
         }
     }
 
@@ -829,6 +875,7 @@ impl AudioPlayback {
         notch_hum: bool,
         hpf_hz: u32,
         notch_override: Option<Vec<f32>>,
+        env_correct: bool,
     ) -> Result<Stream> {
         // tope de seguridad por tiempo (~0.75s) — con deriva compensada
         // la cola vive cerca del objetivo, no del tope
@@ -914,6 +961,17 @@ impl AudioPlayback {
         let notch_cb = notch_out.clone();
         // handle para el tracker adaptativo (re-afinado en caliente)
         *self.notch_handle.lock().unwrap() = notch_out.clone();
+        // corrector de envolvente (lock-in anti-ripple del chip): si
+        // el hum está activo, también el corrector (el ripple es el
+        // mismo acople). Post-notch: mide el residuo que queda.
+        let env_cb = env_correct.then(|| {
+            let ec = Arc::new(Mutex::new(EnvelopeCorrector::new(
+                block_size as usize,
+                sample_rate,
+            )));
+            *self.env_handle.lock().unwrap() = Some(ec.clone());
+            ec
+        });
         let rec_out_file = std::env::var("SCALAPP_REC_OUT").ok().map(|path| {
             let f = std::fs::OpenOptions::new()
                 .create(true)
@@ -1063,10 +1121,14 @@ impl AudioPlayback {
                         );
                         dg.last_underrun_log = Instant::now();
                     }
-                    // notch del hum + grabación de salida (validación)
+                    // notch del hum → corrector de envolvente → rec (la
+                    // validación captura el resultado FINAL)
                     if let Some(nb) = &notch_cb {
                         let mut bank = nb.lock().unwrap();
                         bank.process_interleaved(out);
+                    }
+                    if let Some(ec) = &env_cb {
+                        ec.lock().unwrap().process_interleaved(out);
                     }
                     if let Some(rec) = &rec_out_cb {
                         use std::io::Write;
@@ -1160,6 +1222,8 @@ pub struct AudioCapture {
     notch_override: std::sync::Mutex<Option<Vec<f32>>>,
     /// Notch adaptativo ON (mide el par real y re-afina en caliente).
     notch_auto: std::sync::atomic::AtomicBool,
+    /// Corrector de envolvente ON (lock-in anti-ripple del chip).
+    env_correct: std::sync::atomic::AtomicBool,
 }
 
 impl AudioCapture {
@@ -1195,6 +1259,7 @@ impl AudioCapture {
             hpf_hz: AtomicU32::new(0),
             notch_override: std::sync::Mutex::new(None),
             notch_auto: std::sync::atomic::AtomicBool::new(true),
+            env_correct: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -1219,6 +1284,11 @@ impl AudioCapture {
     /// Notch adaptativo on/off (--no-notch-auto).
     pub fn set_notch_auto(&self, on: bool) {
         self.notch_auto.store(on, Ordering::Relaxed);
+    }
+
+    /// Corrector de envolvente on/off (--no-env-correct).
+    pub fn set_env_correct(&self, on: bool) {
+        self.env_correct.store(on, Ordering::Relaxed);
     }
 
     /// High-pass opcional (--hpf, 0 = off).
@@ -1433,6 +1503,7 @@ impl AudioCapture {
                 self.notch_hum.load(Ordering::Relaxed),
                 self.hpf_hz.load(Ordering::Relaxed),
                 notch_override_freqs,
+                self.env_correct.load(Ordering::Relaxed),
             ) {
                 Ok(out_stream) => {
                     *self.playback.lock().unwrap() = Some(playback.clone());
@@ -1739,6 +1810,156 @@ mod tests {
             let a = atten(&mut b, f);
             assert!(a < 4.0, "{nota} ({f}Hz) dañado: {a:.1}dB");
         }
+    }
+
+    #[test]
+    fn debug_corrector_con_datos_reales() {
+        // diagnóstico con captura real (ignorado si no está el archivo)
+        let Ok(path) = std::env::var("SCALAPP_DEBUG_RAW") else {
+            return;
+        };
+        let raw = std::fs::read(&path).unwrap_or_default();
+        let mono: Vec<f32> = raw
+            .chunks_exact(8)
+            .map(|c| {
+                let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let r = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+                (l + r) * 0.5
+            })
+            .collect();
+        if mono.len() < 48000 * 10 {
+            println!("archivo muy corto");
+            return;
+        }
+        let fs = 48000u32;
+        let bs = 512usize;
+        let mut ec = EnvelopeCorrector::new(bs, fs);
+        for chunk in mono.chunks(bs) {
+            if chunk.len() < bs {
+                break;
+            }
+            let mut buf: Vec<f32> = chunk.iter().flat_map(|v| [*v, *v]).collect();
+            ec.process_interleaved(&mut buf);
+        }
+        println!(
+            "corrector sobre {path}: active={} d={:.4} omega={:.4} ({:.2}Hz)",
+            ec.active,
+            ec.d,
+            ec.omega,
+            ec.omega / (2.0 * std::f64::consts::PI)
+        );
+    }
+
+    #[test]
+    fn debug_lockin_recupera_fase_y_profundidad() {
+        // env = M(1 + 0.2·sin(2π·0.6·t + 1.0)), t absoluto desde 0
+        let mut ec = EnvelopeCorrector::new(1024, 48000);
+        ec.set_target_hz(0.6);
+        let dt = ec.block_dt;
+        let m = 100.0f64;
+        for i in 0..384 {
+            let t = i as f64 * dt;
+            let v = m * (1.0 + 0.2 * (2.0 * std::f64::consts::PI * 0.6 * t + 1.0).sin());
+            ec.env_ring.push(v as f32);
+        }
+        ec.t = 384.0 * dt;
+        ec.relock();
+        // ripple verdadero en t: d·sin(ω t + ψ) con ψ = 1.0
+        let dbg_ripple_at = |t: f64| 0.2 * (2.0 * std::f64::consts::PI * 0.6 * t + 1.0).sin();
+        let t_probe = ec.t;
+        let mine = ec.d * (ec.omega * t_probe + ec.psi).sin();
+        let truth = dbg_ripple_at(t_probe);
+        println!(
+            "d={:.4} (verdad 0.2) omega={:.4} (verdad {:.4}) ripple@t: mío {:.4} vs verdad {:.4}",
+            ec.d,
+            ec.omega,
+            2.0 * std::f64::consts::PI * 0.6,
+            mine,
+            truth
+        );
+        assert!((ec.d - 0.2).abs() < 0.02, "d={}", ec.d);
+        assert!((mine - truth).abs() < 0.02, "fase: {mine} vs {truth}");
+    }
+
+    #[test]
+    fn envelope_corrector_aplanar_el_ripple_sintetico() {
+        // tono 440Hz con ripple de ganancia d=0.2 (~1.6dB) a 0.6Hz —
+        // el corrector debe dejarlo con AM residual < 0.5dB
+        let fs = 48000u32;
+        let bs = 1024usize; // frames por bloque (interleaved 2048)
+        let dur_s = 30usize;
+        let mut ec = EnvelopeCorrector::new(bs, fs);
+        ec.set_target_hz(0.6); // el ripple sintético es a 0.6
+        let mut out_mono = Vec::with_capacity(fs as usize * dur_s);
+        let mut blocks = 0usize;
+        while blocks * bs < fs as usize * dur_s {
+            let t0 = blocks * bs;
+            let mut buf: Vec<f32> = (0..bs)
+                .flat_map(|i| {
+                    let t = (t0 + i) as f64 / f64::from(fs);
+                    let g = 1.0 + 0.2 * (2.0 * std::f64::consts::PI * 0.6 * t).sin();
+                    let s = 0.2 * g * (2.0 * std::f64::consts::PI * 440.0 * t).sin();
+                    [s as f32, s as f32]
+                })
+                .collect();
+            ec.process_interleaved(&mut buf);
+            for p in buf.chunks_exact(2) {
+                out_mono.push((p[0] + p[1]) * 0.5);
+            }
+            blocks += 1;
+        }
+        // medir AM residual de los últimos 15s (post-lock)
+        let seg = &out_mono[fs as usize * 15..];
+        let t: Vec<f64> = (0..seg.len()).map(|i| i as f64 / f64::from(fs)).collect();
+        let env: Vec<f64> = seg
+            .chunks(fs as usize / 100)
+            .map(|c| {
+                let e: f64 = c.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+                (e / c.len() as f64).sqrt()
+            })
+            .collect();
+        let mean = env.iter().sum::<f64>() / env.len() as f64;
+        let (mut isum, mut qsum) = (0.0f64, 0.0f64);
+        let dt = 0.01f64;
+        for (i, &v) in env.iter().enumerate() {
+            let th = 2.0 * std::f64::consts::PI * 0.6 * (i as f64 * dt);
+            isum += v * th.cos();
+            qsum += v * th.sin();
+        }
+        let d_res = 2.0 * (isum * isum + qsum * qsum).sqrt() / (mean * env.len() as f64);
+        let db_res = 20.0 * (1.0 + d_res).log10();
+        assert!(
+            db_res < 0.5,
+            "AM residual {db_res:.2}dB (d={d_res:.3}) — el corrector no aplanó"
+        );
+        // y sin NaN / niveles sanos
+        assert!(out_mono.iter().all(|v| v.is_finite()));
+        let rms = (out_mono.iter().map(|v| v * v).sum::<f32>() / out_mono.len() as f32).sqrt();
+        assert!((0.13..=0.30).contains(&rms), "RMS {rms:.3} fuera de rango");
+    }
+
+    #[test]
+    fn envelope_corrector_passthrough_tono_estatico() {
+        // sin ripple: el corrector no debe tocar la señal (d≈0)
+        let fs = 48000u32;
+        let bs = 1024usize;
+        let mut ec = EnvelopeCorrector::new(bs, fs);
+        let mut peak_dev = 0.0f32;
+        for b in 0..(fs as usize * 15 / bs) {
+            let t0 = b * bs;
+            let mut buf: Vec<f32> = (0..bs)
+                .flat_map(|i| {
+                    let t = (t0 + i) as f64 / f64::from(fs);
+                    let s = 0.2 * (2.0 * std::f64::consts::PI * 440.0 * t).sin();
+                    [s as f32, s as f32]
+                })
+                .collect();
+            let before = buf[100];
+            ec.process_interleaved(&mut buf);
+            let after = buf[100];
+            peak_dev = peak_dev.max(((after - before) / before).abs());
+        }
+        assert!(peak_dev < 0.05, "desvío {peak_dev:.3} — corrigió sin ripple");
     }
 
     #[test]

@@ -222,6 +222,11 @@ struct Args {
     #[arg(long = "no-notch-auto")]
     no_notch_auto: bool,
 
+    /// Desactiva el corrector de envolvente (lock-in que aplana el
+    /// ripple de ganancia ~0.6Hz que el chip impone al contenido).
+    #[arg(long = "no-env-correct")]
+    no_env_correct: bool,
+
     /// Iniciar con ventana borderless: SIN barra de título ni bordes (no
     /// es fullscreen — la ventana conserva tamaño y posición). Igual que
     /// presionar F; F/Esc la devuelven a ventana normal.
@@ -363,6 +368,7 @@ fn run(args: Args) -> Result<()> {
     }
     audio_capture.set_notch_hum(!args.no_notch_hum);
     audio_capture.set_notch_auto(!args.no_notch_auto);
+    audio_capture.set_env_correct(!args.no_env_correct);
     audio_capture.set_hpf(args.hpf);
     if let Some(spec) = &args.notch_hum_at {
         // "--notch-hum-at 59.5,60.5" — frecuencias medidas con
