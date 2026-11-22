@@ -227,10 +227,26 @@ fn apply_color_adjust(buf: &mut [u8], rg: f32, sat: f32) {
 /// por PAR de píxeles en vez de ~12 por píxel. El gain de rojo se
 /// aplica sobre la R decodificada. Diferencias solo por redondeo ±1
 /// LSB en colores saturados a tope.
-fn decode_yuyv_to_rgba(yuyv: &[u8], red_gain: f32, saturation: f32) -> Vec<u8> {
-    let neutral = (red_gain - 1.0).abs() <= 1e-3 && (saturation - 1.0).abs() <= 1e-3;
+/// Decode YUYV → RGBA en UNA sola pasada, con el ajuste de color inline.
+///
+/// BRILLO: offset aditivo sobre la luma Y ANTES del decode (unidades Y
+/// de BT.601, rango útil ±30) — levanta sombras sin tocar la croma,
+/// costo cero (se suma al mismo entero). Pedido del usuario 22/11:
+/// "aumentarle un poquito el brillo en el procesamiento".
+///
+/// AJUSTE DE COLOR EN DOMINIO YUV: desaturar hacia luma en RGB
+/// (luma = 0.299R+0.587G+0.114B — mismos pesos que Y de BT.601) es
+/// matemáticamente equivalente a escalar (U,V) hacia 128 → 2 float
+/// por PAR de píxeles en vez de ~12 por píxel. El gain de rojo se
+/// aplica sobre la R decodificada. Diferencias solo por redondeo ±1
+/// LSB en colores saturados a tope.
+fn decode_yuyv_to_rgba(yuyv: &[u8], red_gain: f32, saturation: f32, brightness: f32) -> Vec<u8> {
+    let neutral = (red_gain - 1.0).abs() <= 1e-3
+        && (saturation - 1.0).abs() <= 1e-3
+        && brightness.abs() <= 1e-3;
     let scale_chroma = !neutral && (saturation - 1.0).abs() > 1e-3;
     let scale_red = !neutral && (red_gain - 1.0).abs() > 1e-3;
+    let y_off = if neutral { 0 } else { brightness.round() as i32 };
     let n_px = yuyv.len() / 4 * 2;
     let mut out = vec![0u8; n_px * 4];
     let mut o = 0usize;
@@ -242,7 +258,7 @@ fn decode_yuyv_to_rgba(yuyv: &[u8], red_gain: f32, saturation: f32) -> Vec<u8> {
             e = ((e as f32) * saturation).round() as i32;
         }
         for &y in [&chunk[0], &chunk[2]] {
-            let c298 = (i32::from(y) - 16) * 298;
+            let c298 = (i32::from(y) - 16 + y_off) * 298;
             let r = ((c298 + 409 * e + 128) >> 8).clamp(0, 255);
             let g = ((c298 - 100 * d - 208 * e + 128) >> 8).clamp(0, 255);
             let b = ((c298 + 516 * d + 128) >> 8).clamp(0, 255);
@@ -313,7 +329,7 @@ pub struct VideoCapture {
     /// no en el loop de render: 2M píxeles de float por frame no deben
     /// pisar el presupuesto del hilo de UI (judder). Calibrado por el
     /// usuario contra el monitor físico; persiste en ~/.scalapp_color.
-    color_adjust: Arc<Mutex<(f32, f32)>>,
+    color_adjust: Arc<Mutex<(f32, f32, f32)>>,
     /// Trace de eventos (SCALAPP_TRACE) — stores acá, paints desde el
     /// renderer via trace_log().
     trace: Arc<Mutex<Trace>>,
@@ -367,7 +383,7 @@ impl VideoCapture {
             fps,
             allow_index_scan: true,
             frame_notifier: Arc::new(Mutex::new(None)),
-            color_adjust: Arc::new(Mutex::new((1.0, 1.0))),
+            color_adjust: Arc::new(Mutex::new((1.0, 1.0, 0.0))),
             trace: Arc::new(Mutex::new(Trace::from_env())),
             allow_webcam: false,
             latest: Arc::new(Mutex::new(None)),
@@ -389,8 +405,8 @@ impl VideoCapture {
     /// `ctx.request_repaint()` para pintar exactamente cuando llega.
     /// Ajuste de color (gain de R, saturación) aplicado en el thread de
     /// captura — lo alimenta el renderer desde los sliders.
-    pub fn set_color_adjust(&self, red_gain: f32, saturation: f32) {
-        *self.color_adjust.lock().unwrap() = (red_gain, saturation);
+    pub fn set_color_adjust(&self, red_gain: f32, saturation: f32, brightness: f32) {
+        *self.color_adjust.lock().unwrap() = (red_gain, saturation, brightness);
     }
 
     /// Tasa de frames medida en el RELOJ DEL DEVICE (capture_timestamp
@@ -734,9 +750,9 @@ impl VideoCapture {
                     // decode YUYV→RGBA en UNA pasada (decode + color + alpha):
                     // reemplaza las 3 pasadas anteriores (nokhwa decode →
                     // color adjust → RGB→RGBA del renderer)
-                    let (rg, sat) = *self.color_adjust.lock().unwrap();
+                    let (rg, sat, bright) = *self.color_adjust.lock().unwrap();
                     let resolution = frame_buffer.resolution();
-                    let rgba = decode_yuyv_to_rgba(frame_buffer.buffer(), rg, sat);
+                    let rgba = decode_yuyv_to_rgba(frame_buffer.buffer(), rg, sat, bright);
                     {
                         let width = resolution.width_x;
                         let height = resolution.height_y;
@@ -1097,7 +1113,7 @@ mod tests {
         for i in 0..128u8 {
             yuyv.extend_from_slice(&[i, 30 + i % 200, 255 - i, 50 + i % 190]);
         }
-        let ours = decode_yuyv_to_rgba(&yuyv, 1.0, 1.0);
+        let ours = decode_yuyv_to_rgba(&yuyv, 1.0, 1.0, 0.0);
         let theirs = nokhwa_core::types::yuyv422_to_rgb(&yuyv, false).unwrap();
         for (px, (o, t)) in ours
             .as_chunks::<4>()
@@ -1119,7 +1135,7 @@ mod tests {
         for i in 0..64u8 {
             yuyv.extend_from_slice(&[i, 30 + i % 200, 255 - i, 50 + i % 190]);
         }
-        let gray = decode_yuyv_to_rgba(&yuyv, 1.0, 0.0);
+        let gray = decode_yuyv_to_rgba(&yuyv, 1.0, 0.0, 0.0);
         for px in gray.as_chunks::<4>().0 {
             assert_eq!(px[0], px[1], "gris: R=G");
             assert_eq!(px[1], px[2], "gris: G=B");
@@ -1139,8 +1155,8 @@ mod tests {
             yuyv.extend_from_slice(&[i, 60 + i % 140, 255 - i, 70 + i % 120]);
         }
         let sat = 0.75f32;
-        let ours = decode_yuyv_to_rgba(&yuyv, 1.0, sat);
-        let neutral = decode_yuyv_to_rgba(&yuyv, 1.0, 1.0);
+        let ours = decode_yuyv_to_rgba(&yuyv, 1.0, sat, 0.0);
+        let neutral = decode_yuyv_to_rgba(&yuyv, 1.0, 1.0, 0.0);
         let mut comparados = 0usize;
         for (px_new, px_ref) in ours
             .as_chunks::<4>()
@@ -1185,6 +1201,32 @@ mod tests {
         assert_eq!(decimate_step(30, 50.0), 2);
         // cap 24 sobre 60 → 2.5 → 3 (redondeo a nearest)
         assert_eq!(decimate_step(24, 60.0), 3);
+    }
+
+    #[test]
+    fn brightness_levanta_luma_sin_tocar_croma() {
+        // offset aditivo sobre Y: gris neutro + brillo → mismo gris más
+        // claro (Y+off), sin meter color (R=G=B sigue)
+        let mut yuyv = Vec::new();
+        for i in 0..=200u8 {
+            yuyv.extend_from_slice(&[i, 128, 255 - i, 128]); // croma neutra
+        }
+        let base = decode_yuyv_to_rgba(&yuyv, 1.0, 1.0, 0.0);
+        let bright = decode_yuyv_to_rgba(&yuyv, 1.0, 1.0, 10.0);
+        let mut lifted = 0;
+        for (b, br) in base.as_chunks::<4>().0.iter().zip(bright.as_chunks::<4>().0) {
+            // sigue gris
+            assert_eq!(br[0], br[1]);
+            assert_eq!(br[1], br[2]);
+            // sin clipping: exactamente +10 Y → ~+12 RGB (298/256)
+            if b[0] < 200 && b[0] > 30 {
+                let delta = i32::from(br[0]) - i32::from(b[0]);
+                assert!((10..=13).contains(&delta), "delta {delta}");
+                lifted += 1;
+            }
+        }
+        assert!(lifted > 30, "muy pocos píxeles comparables: {lifted}");
+        // y las sombras profundas (Y bajo 16) también suben (clamp a 0)
     }
 
     #[test]

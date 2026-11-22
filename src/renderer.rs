@@ -155,10 +155,13 @@ pub struct RendererApp {
     health: VideoHealth,
     /// Ajuste de color por ojo (la MS2131 + YUYV puede correr levemente
     /// al rojo vs el monitor físico — referencia del usuario):
-    /// red_gain multiplica el canal R, saturation mezcla hacia la luma.
-    /// 1.0/1.0 = neutro. Persiste en ~/.scalapp_color.
+    /// red_gain multiplica el canal R, saturation mezcla hacia la luma,
+    /// brightness es offset aditivo sobre la luma Y (±30 unidades
+    /// BT.601 — "un poquito más de brillo", 22/11).
+    /// 1.0/1.0/0 = neutro. Persiste en ~/.scalapp_color.
     red_gain: f32,
     saturation: f32,
+    brightness: f32,
     /// Mipmaps en la textura de video (tecla M): minificación con
     /// footprint real en vez de 4 taps bilineares — la diferencia
     /// contra el canvas 1:1 de OBS cuando la ventana no calza exacto
@@ -221,12 +224,13 @@ impl RendererApp {
             next_deadline: None,
             red_gain: 1.0,
             saturation: 1.0,
+            brightness: 0.0,
             mipmaps: true,
         };
         app.load_color_adjust();
         // empujar el ajuste cargado al thread de captura (ahí se aplica)
         app.video
-            .set_color_adjust(app.red_gain, app.saturation);
+            .set_color_adjust(app.red_gain, app.saturation, app.brightness);
         app
     }
 
@@ -251,17 +255,25 @@ impl RendererApp {
                     self.saturation = f.clamp(0.0, 1.5);
                 }
             }
+            if let Some(v) = line.strip_prefix("bright ") {
+                if let Ok(f) = v.trim().parse::<f32>() {
+                    self.brightness = f.clamp(-30.0, 30.0);
+                }
+            }
         }
         println!(
-            "✓ Ajuste de color: rojo x{:.2} saturación x{:.2}",
-            self.red_gain, self.saturation
+            "✓ Ajuste de color: rojo x{:.2} saturación x{:.2} brillo {:+.0}",
+            self.red_gain, self.saturation, self.brightness
         );
     }
 
     fn save_color_adjust(&self) {
         let _ = std::fs::write(
             Self::color_adjust_path(),
-            format!("red {:.3}\nsat {:.3}\n", self.red_gain, self.saturation),
+            format!(
+                "red {:.3}\nsat {:.3}\nbright {:.3}\n",
+                self.red_gain, self.saturation, self.brightness
+            ),
         );
     }
 
@@ -518,20 +530,31 @@ impl eframe::App for RendererApp {
                         .add(egui::Slider::new(&mut self.red_gain, 0.5..=1.5).text("Rojo"))
                         .changed()
                     {
-                        self.video.set_color_adjust(self.red_gain, self.saturation);
+                        self.video
+                            .set_color_adjust(self.red_gain, self.saturation, self.brightness);
                         self.save_color_adjust();
                     }
                     if ui
                         .add(egui::Slider::new(&mut self.saturation, 0.0..=1.5).text("Saturación"))
                         .changed()
                     {
-                        self.video.set_color_adjust(self.red_gain, self.saturation);
+                        self.video
+                            .set_color_adjust(self.red_gain, self.saturation, self.brightness);
+                        self.save_color_adjust();
+                    }
+                    if ui
+                        .add(egui::Slider::new(&mut self.brightness, -30.0..=30.0).text("Brillo"))
+                        .changed()
+                    {
+                        self.video
+                            .set_color_adjust(self.red_gain, self.saturation, self.brightness);
                         self.save_color_adjust();
                     }
                     if ui.button("↺").clicked() {
                         self.red_gain = 1.0;
                         self.saturation = 1.0;
-                        self.video.set_color_adjust(1.0, 1.0);
+                        self.brightness = 0.0;
+                        self.video.set_color_adjust(1.0, 1.0, 0.0);
                         self.save_color_adjust();
                     }
                     let borderless_label = if self.borderless {
